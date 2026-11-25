@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -55,7 +56,13 @@ func fixture(t *testing.T) (config, *clock) {
 		t.Fatal(err)
 	}
 	clk := &clock{t: time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)}
+	// Firmware that starts the Vault with the app that needs it: idle exit is on.
+	caps := filepath.Join(tmp, "q2-addon.caps")
+	if err := os.WriteFile(caps, []byte("art now needs window\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	return config{
+		Caps:   caps,
 		Dir:    filepath.Join(card, ".vault"),
 		Card:   card,
 		Sealed: filepath.Join(card, ".q2vault"),
@@ -73,11 +80,8 @@ func fixture(t *testing.T) (config, *clock) {
 
 // asPlex is proto's server with the caller check replaced: every caller is the
 // app "plex" (peer credentials and /proc/<pid>/exe can't be faked in a test).
-func asPlex(ctx context.Context, socket string, b proto.Backend, _ string, onUse func(string)) error {
-	ln, err := net.Listen("unix", socket)
-	if err != nil {
-		return err
-	}
+func asPlex(ctx context.Context, ln *proto.Listener, b proto.Backend, _ string, onUse func(string)) error {
+	defer ln.Close()
 	go func() { <-ctx.Done(); ln.Close() }()
 	var wg sync.WaitGroup
 	defer wg.Wait()
@@ -260,6 +264,12 @@ func TestRunRealSocketRefusesAndStopsOnTerm(t *testing.T) {
 	cfg.OnStop = func() { close(stopped) }
 	ctx, cancel := context.WithCancel(context.Background())
 	done := start(t, ctx, cfg)
+	// Apps (uid 1000) reach the Vault's socket; only the firmware's UI (root) the page's.
+	for path, want := range map[string]os.FileMode{cfg.Socket: 0o666, cfg.Browse: 0o600} {
+		if fi, err := os.Lstat(path); err != nil || fi.Mode().Perm() != want {
+			t.Errorf("%s: mode %v, want %v (%v)", filepath.Base(path), fi.Mode().Perm(), want, err)
+		}
+	}
 	// The test process is no card app: proto's own server refuses it.
 	if got := ask(t, cfg.Socket, "get", nil); got != "Q2VAULT/1\nrefused\n" {
 		t.Fatalf("get from a non-app: %q", got)
@@ -606,5 +616,108 @@ func TestRunFailsWithoutItsPage(t *testing.T) {
 	}
 	if !wiped || exists(cfg.Socket) {
 		t.Fatalf("not closed cleanly: wiped %v, socket left %v", wiped, exists(cfg.Socket))
+	}
+}
+
+func TestRunNeverIdleExitsWithoutNeeds(t *testing.T) {
+	// Firmware without needs= restarts nothing that closes: the Vault stays.
+	cfg, clk := fixture(t)
+	cfg.Serve = asPlex
+	os.Remove(cfg.Caps)
+	done := start(t, context.Background(), cfg)
+	for range 3 {
+		clk.Add(10 * time.Minute)
+		time.Sleep(50 * time.Millisecond)
+	}
+	os.WriteFile(cfg.Caps, []byte("art now window\n"), 0o644) // other words only
+	clk.Add(10 * time.Minute)
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case err := <-done:
+		t.Fatalf("closed on firmware without needs=: %v", err)
+	default:
+	}
+	// The caps are read again at each idle decision.
+	os.WriteFile(cfg.Caps, []byte("art needs window\n"), 0o644)
+	clk.Add(time.Second)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("still running once the firmware has needs=")
+	}
+}
+
+func TestRunStaysForAnAppThatAskedThisRun(t *testing.T) {
+	// plex has no needs=vault and no sealed file yet (signing in for the first
+	// time); it asked, so it counts as an app that uses the Vault until it stops.
+	cfg, clk := fixture(t)
+	cfg.Serve = asPlex
+	var mu sync.Mutex
+	plexUp := true
+	cfg.running = func(_, id string) bool { mu.Lock(); defer mu.Unlock(); return id == "plex" && plexUp }
+	done := start(t, context.Background(), cfg)
+	if got := ask(t, cfg.Socket, "get", nil); got != "Q2VAULT/1\nnone\n" {
+		t.Fatalf("get: %q", got)
+	}
+	for range 3 {
+		clk.Add(40 * time.Second)
+		time.Sleep(50 * time.Millisecond)
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("closed while an app that asked runs: %v", err)
+	default:
+	}
+	mu.Lock()
+	plexUp = false
+	mu.Unlock()
+	time.Sleep(50 * time.Millisecond)
+	clk.Add(61 * time.Second)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("still running after the app stopped")
+	}
+}
+
+func TestFirmwareHas(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "caps")
+	if firmwareHas(p, "needs") {
+		t.Fatal("no file has needs")
+	}
+	for text, want := range map[string]bool{
+		"needs\n": true, "art needs now\n": true, "art\tneeds": true, "needsx art": false,
+		"art now": false, "": false, "xneeds": false,
+	} {
+		os.WriteFile(p, []byte(text), 0o644)
+		if got := firmwareHas(p, "needs"); got != want {
+			t.Errorf("%q: %v, want %v", text, got, want)
+		}
+	}
+}
+
+func TestRunSetsAsideAFolderAtThePagePath(t *testing.T) {
+	cfg, _ := fixture(t)
+	cfg.Serve = asPlex
+	os.MkdirAll(filepath.Join(cfg.Browse, "inside"), 0o755)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- run(ctx, cfg) }()
+	waitFor(t, "the page's socket in place of the folder", func() bool {
+		fi, err := os.Lstat(cfg.Browse)
+		return err == nil && fi.Mode()&os.ModeSocket != 0
+	})
+	if !exists(filepath.Join(cfg.Browse+".bad."+strconv.Itoa(os.Getpid()), "inside")) {
+		t.Fatal("folder not set aside")
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }

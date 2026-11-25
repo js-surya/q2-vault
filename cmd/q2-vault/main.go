@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -41,12 +42,13 @@ type config struct {
 	Tmp    string // where card apps' pid files are, /tmp
 	Mounts string // /proc/mounts
 	Proc   string // /proc, for the caller check
+	Caps   string // the firmware's card-app features, /tmp/q2-addon.caps: idle exit needs "needs"
 
 	Now    func() time.Time
 	Tick   time.Duration // how often running apps are checked: 5 s
 	Rand   io.Reader     // for a new master key: /dev/hwrng, else the system's
 	Logf   func(string, ...any)
-	Serve  func(ctx context.Context, socket string, b proto.Backend, procRoot string, onUse func(string)) error
+	Serve  func(ctx context.Context, l *proto.Listener, b proto.Backend, procRoot string, onUse func(string)) error
 	OnStop func() // at TERM or INT (not an idle close): the removal watch
 
 	running func(tmp, id string) bool // idle.Running; a hook for tests
@@ -73,6 +75,7 @@ func cli(args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&cfg.Tmp, "tmp", "/tmp", "where card apps' pid files are")
 	fs.StringVar(&cfg.Mounts, "mounts", "/proc/mounts", "the mount table")
 	fs.StringVar(&cfg.Proc, "proc", "/proc", "the process table")
+	fs.StringVar(&cfg.Caps, "caps", "/tmp/q2-addon.caps", "the firmware's card-app features")
 	showVersion := fs.Bool("version", false, "print the version and exit")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -91,6 +94,9 @@ func cli(args []string, stdout, stderr io.Writer) int {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 	cfg.Logf("%s starting", version)
+	if err := harden(); err != nil {
+		cfg.Logf("harden: %v", err)
+	}
 	if err := run(ctx, cfg); err != nil {
 		cfg.Logf("%v", err)
 		return 1
@@ -99,8 +105,8 @@ func cli(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-// run serves until ctx ends (TERM, INT) or no app has used the Vault for a while, then stops serving,
-// wipes the key from memory and returns. Never logs a secret or a key.
+// run serves until ctx ends (TERM, INT) or, on firmware with needs=, no app has used the Vault for a
+// while, then stops serving, wipes the key from memory and returns. Never logs a secret or a key.
 func run(ctx context.Context, cfg config) error {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
@@ -115,7 +121,7 @@ func run(ctx context.Context, cfg config) error {
 		cfg.Logf = func(string, ...any) {}
 	}
 	if cfg.Serve == nil {
-		cfg.Serve = proto.Serve
+		cfg.Serve = proto.ServeOn
 	}
 	if cfg.running == nil {
 		cfg.running = idle.Running
@@ -181,12 +187,37 @@ func run(ctx context.Context, cfg config) error {
 		return inner(op, args)
 	}
 
+	// Both sockets are bound here, one after the other and before anything else runs: each narrows
+	// the process's umask for its bind (0666 for apps, 0600 for the page), so no other file is made
+	// meanwhile.
+	vl, err := proto.Listen(cfg.Socket)
+	if err != nil {
+		wipe(&st.Master)
+		return fmt.Errorf("vault socket: %w", err)
+	}
+	pl, err := listenPage(cfg.Browse)
+	if err != nil {
+		vl.Close()
+		wipe(&st.Master)
+		return fmt.Errorf("page socket: %w", err)
+	}
+
 	sctx, scancel := context.WithCancel(context.Background())
 	defer scancel()
 	vaultDone := make(chan error, 1)
-	go func() { vaultDone <- cfg.Serve(sctx, cfg.Socket, st, cfg.Proc, func(string) { tracker.Seen() }) }()
-	pageDone := make(chan error, 1) // nil once stopped; an error when it couldn't start or failed
-	go func() { pageDone <- q2spot.Serve(sctx, cfg.Browse, page) }()
+	// Every app that has asked this run counts as one that uses the Vault, until the Vault ends: an
+	// app signing in for the first time has no needs=vault (old firmware) and no sealed file yet.
+	var askedMu sync.Mutex
+	asked := map[string]bool{}
+	onUse := func(id string) {
+		tracker.Seen()
+		askedMu.Lock()
+		asked[id] = true
+		askedMu.Unlock()
+	}
+	go func() { vaultDone <- cfg.Serve(sctx, vl, st, cfg.Proc, onUse) }()
+	pageDone := make(chan error, 1) // nil once stopped; an error when it failed
+	go func() { pageDone <- q2spot.ServeListener(sctx, pl, page) }()
 
 	users := idle.Users(cfg.Card, cfg.Sealed)
 	usersAt := cfg.Now()
@@ -230,22 +261,32 @@ loop:
 				tracker.Seen()
 			}
 			lastTick = now
-			for _, id := range users {
+			askedMu.Lock()
+			ids := append([]string(nil), users...)
+			for id := range asked {
+				ids = append(ids, id)
+			}
+			askedMu.Unlock()
+			for _, id := range ids {
 				if cfg.running(cfg.Tmp, id) {
 					tracker.Seen()
 					break
 				}
 			}
-			if tracker.Idle() {
+			// Only firmware with needs= starts the Vault again for the next app that needs it;
+			// without it, closing would sign apps out until Wi-Fi or its row starts it, so it stays
+			// (wifi=1's stop and a TERM still end it). The caps are read at each idle decision.
+			if tracker.Idle() && firmwareHas(cfg.Caps, "needs") {
 				logf("no app uses the Vault: closing")
 				break loop
 			}
 		}
 	}
 
-	// Stop serving; requests in progress (a write among them) finish first. Each has a 5 s deadline,
-	// and the launcher KILLs the app 2 s after its TERM: a request cut off by the KILL leaves at most a
-	// <id>.sealed.tmp (writes are tmp + rename, never in place), which Clean removes at the next start.
+	// Stop serving; requests in progress (a write among them) finish first. Their connections'
+	// deadlines move to now (proto.ServeOn), so a slow client can't hold the stop; the launcher KILLs
+	// the app 2 s after its TERM, and a write cut off by the KILL leaves at most a <id>.sealed.tmp
+	// (writes are tmp + rename, never in place), which Clean removes at the next start.
 	scancel()
 	if !served {
 		if err := <-vaultDone; err != nil {
@@ -360,6 +401,32 @@ func writeKey(path string, k [32]byte) error {
 	}
 	defer d.Close()
 	return d.Sync()
+}
+
+// listenPage binds the page's socket root-only (0600): the firmware's UI, which asks it, runs as
+// root, and no card app has any business there. A folder planted at the path is set aside.
+func listenPage(path string) (net.Listener, error) {
+	if err := proto.ClearPath(path); err != nil {
+		return nil, err
+	}
+	old := syscall.Umask(0o177)
+	l, err := net.Listen("unix", path)
+	syscall.Umask(old)
+	return l, err
+}
+
+// firmwareHas reports whether the firmware's caps file (one line of words) lists word.
+func firmwareHas(caps, word string) bool {
+	b, err := os.ReadFile(caps)
+	if err != nil {
+		return false
+	}
+	for _, w := range strings.Fields(string(b)) {
+		if w == word {
+			return true
+		}
+	}
+	return false
 }
 
 // wanted reports whether the launcher touched path after since (the previous tick).
