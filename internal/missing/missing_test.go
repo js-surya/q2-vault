@@ -109,3 +109,36 @@ func TestLoadCorruptReturnsErrorAndUsableEmpty(t *testing.T) {
 		t.Fatalf("null: %v %v", s, err)
 	}
 }
+
+func TestClockBeforeFloorChangesNothing(t *testing.T) {
+	s := State{Missing: map[string]time.Time{"a": t0, "gone": t0}}
+	rm := Sweep(&s, []string{"a", "b"}, gone, time.Unix(0, 0))
+	if rm != nil || len(s.Missing) != 2 || !s.Missing["a"].Equal(t0) || !s.Missing["gone"].Equal(t0) {
+		t.Fatalf("rm=%v state=%v", rm, s.Missing)
+	}
+}
+
+func TestImplausibleStoredTimeRestamped(t *testing.T) {
+	now := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	s := State{Missing: map[string]time.Time{"a": time.Unix(0, 0).UTC(), "z": {}}}
+	rm := Sweep(&s, []string{"a", "z"}, gone, now)
+	if len(rm) != 0 || !s.Missing["a"].Equal(now) || !s.Missing["z"].Equal(now) {
+		t.Fatalf("rm=%v state=%v", rm, s.Missing)
+	}
+}
+
+func TestBackwardsClockRemovesNothing(t *testing.T) {
+	s := State{Missing: map[string]time.Time{"a": t0}}
+	rm := Sweep(&s, []string{"a"}, gone, t0.Add(-time.Hour))
+	if len(rm) != 0 || !s.Missing["a"].Equal(t0) {
+		t.Fatalf("rm=%v state=%v", rm, s.Missing)
+	}
+}
+
+func TestDuplicateIDsReturnedOnce(t *testing.T) {
+	s := State{Missing: map[string]time.Time{"a": t0}}
+	rm := Sweep(&s, []string{"a", "a"}, gone, t0.Add(8*24*time.Hour))
+	if !reflect.DeepEqual(rm, []string{"a"}) {
+		t.Fatalf("rm=%v", rm)
+	}
+}

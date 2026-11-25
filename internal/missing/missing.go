@@ -16,6 +16,10 @@ import (
 // Grace is how long an app must stay missing before its login goes.
 const Grace = 7 * 24 * time.Hour
 
+// Floor is the earliest plausible date. A clock reading before it (the Q2
+// before it has synced time) is not trusted. Tests may override it.
+var Floor = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
 // State maps an app id to when it was first seen missing.
 type State struct {
 	Missing map[string]time.Time `json:"missing"`
@@ -81,17 +85,31 @@ func (s State) Save(path string) error {
 }
 
 // Sweep updates s for the stored login ids and returns the ids whose login
-// should now be deleted. An id not installed is stamped with now the first
-// time; once missing for Grace or longer it is returned and dropped. An
-// installed id is dropped from Missing, as is any id no longer in ids.
+// should now be deleted.
+//
+// Contract: if now is before Floor the clock is not trusted, so Sweep returns
+// nil and changes nothing. Otherwise an id not installed is stamped with now
+// the first time; a stored first-seen time that is zero or before Floor is
+// unknown and is re-stamped with now. Once missing for Grace or longer an id
+// is returned (once, even if listed twice) and dropped. An installed id is
+// dropped from Missing, as is any id no longer in ids. A clock that runs
+// backwards never removes anything: the elapsed time is negative.
 func Sweep(s *State, ids []string, installed func(id string) bool, now time.Time) (remove []string) {
+	if now.Before(Floor) {
+		return nil
+	}
 	next := make(map[string]time.Time, len(ids))
+	seen := make(map[string]bool, len(ids))
 	for _, id := range ids {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
 		if installed(id) {
 			continue
 		}
 		first, ok := s.Missing[id]
-		if !ok {
+		if !ok || first.IsZero() || first.Before(Floor) {
 			first = now
 		}
 		if now.Sub(first) >= Grace {
