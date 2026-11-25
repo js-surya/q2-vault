@@ -74,7 +74,7 @@ belongs to.
 | `/mnt/mmc/.vault/` | the app: `q2app`, `run`, `q2-vault`, icons | the card |
 | `/mnt/mmc/.q2vault/<id>.sealed` | one app's sealed login | the card |
 | `/tmp/q2-vault.sock` | the socket apps ask | root, mode 0666 |
-| `/tmp/q2-vault.browse.sock` | the Vault's own page | as any card app |
+| `/tmp/q2-vault.browse.sock` | the Vault's own page | root, mode 0600 (the firmware's UI runs as root) |
 
 The sealed files are in `.q2vault/`, **not** in the app's own folder `.vault/`: an App Store update or remove works
 on `.vault/`, and must never touch the logins. The firmware ignores `.q2vault/` (no `q2app` in it), and Q2 Pod's
@@ -127,12 +127,15 @@ answer:   Q2VAULT/1\n<status>\n[body]    status: ok | none | refused | too-large
 
 - **Starting:** with `needs=vault` the firmware starts the Vault before an app that needs it. Without it,
   `wifi=1` starts it when Wi-Fi connects, and opening its row starts it as any card app.
-- **An app that finds no socket:** if `.vault/q2-vault` exists, it retries for up to 5 s (the Vault may be
-  starting); if not, or still no socket, it uses its own file as before.
+- **An app that finds no socket:** if `.vault/q2-vault` exists and the launcher's `/tmp/q2-vault` names a
+  live pid, it retries for up to 5 s (the Vault may be starting); if not, or still no socket, it uses its
+  own file as before ("not now": no migration; a Sign Out's `delete` is retried later).
 - **Closing itself:** every 5 s the Vault checks the pid files `/tmp/q2-<id>` (alive: the pid exists) of the card
   apps whose `q2app` says `needs=vault`, a list it reads at start and again every 60 s (not every 5 s: card reads).
-  Apps that have a sealed file count too, for firmware without `needs=`. When none has run for 30 s, and its own page hasn't been asked for
-  in 60 s, it wipes the key, removes its socket and pid file, and exits. An app streaming in the background is
+  Apps that have a sealed file count too, and every app that has asked during this run. When none has run for 30 s, and its own page hasn't been asked for
+  in 60 s, it wipes the key, removes its socket and pid file, and exits: only when the firmware lists
+  `needs` in `/tmp/q2-addon.caps` (read at each such decision), since only that firmware starts it again
+  for the next app. Without it the Vault stays until `wifi=1`'s stop or a TERM (fix wave, 2026-11-25). An app streaming in the background is
   still running, so the Vault stays. Apps keep their secret in memory, so closing signs nothing out.
 - **USB storage, shutdown:** the firmware's TERM: the Vault finishes any write in progress, wipes the key, exits.
 - **Updating the Vault:** an App Store update replaces the binary; the key and sealed files stay.

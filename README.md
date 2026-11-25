@@ -21,15 +21,22 @@ service, and for the makers of those apps. Playback never waits on it: there is 
   before the app. That `needs=` key is **planned**: it has been proposed for Q2 Pod and is not in any
   release yet. Until then the Vault starts with Wi-Fi (`wifi=1`), or when you open its row, and apps
   that find no Vault use their own plain file as before.
-- **It closes itself** 30 seconds after the last app that uses it stops (60 seconds after you last opened
-  its page). Apps keep their login in memory, so closing signs nothing out. While an app plays in the
-  background, the Vault stays.
+- **It closes itself only on firmware with `needs=`** (the firmware lists `needs` in
+  `/tmp/q2-addon.caps`): 30 seconds after the last app that uses it stops, 60 seconds after you last
+  opened its page. That firmware starts it again before the next app that needs it. Apps keep their
+  login in memory, so closing signs nothing out, and while an app plays in the background the Vault
+  stays. An app that has asked it anything counts as one that uses it until the Vault ends, so an app
+  signing in for the first time keeps it open. **On firmware without `needs=` it never closes itself:**
+  nothing would start it again for the next app. Wi-Fi going away (its `wifi=1` stop), USB storage and
+  shutdown still stop it.
 - **Its page** is in Library → Apps → Vault: the apps with a saved login and the date, **Remove** per app
   (it asks to sign in next time) and **Erase All Logins**, which deletes every login and makes a new key,
-  for selling or lending the Q2. Both ask first: press twice. The page never shows a secret.
+  for selling or lending the Q2. Both ask first: press twice. Apps already running keep their login in
+  memory after Erase All Logins until they stop, and a login one of them saves afterwards is sealed with
+  the new key. The page never shows a secret.
 - **A removed app's login is deleted** 7 days after the Vault first sees the app missing (a card swap or
-  an update moves files briefly, so not at once). Until then the page shows "(not installed)". It never
-  deletes on a clock set before 2026.
+  an update moves files briefly, so not at once). The check runs each time the Vault starts. Until then
+  the page shows "(not installed)". It never deletes on a clock set before 2026.
 - **Updating the Vault** keeps the key and the logins. Removing it while it runs deletes both; removed
   while closed, the key stays, so a reinstall opens the same logins.
 
@@ -59,7 +66,11 @@ service, and for the makers of those apps. Playback never waits on it: there is 
   another app's binary on the card would be handed that app's login at its next start.
 - **While the Vault isn't running, another app could listen on its socket path.** The client therefore
   refuses a socket not owned by root and sends nothing.
-- **Logins only.** Music, settings and caches are not encrypted.
+- **Any app can rewrite the Vault's own files on the card** (`.vault/q2-vault`, `run`), which are
+  exFAT like the rest of it, and so run as root at the Vault's next start. That is true of every
+  `root=1` card app on today's firmware, not only the Vault.
+- **Card apps' logins only.** Music, settings and caches are not encrypted, and the firmware's own
+  logins (`.scrobble.ini`) are out of scope: they need firmware code.
 - **Swapping cards:** the other card's logins stay on that card; on this one, apps sign in again.
 
 ## For app makers
@@ -74,14 +85,18 @@ secret, err := vault.Get()
 - `Get() ([]byte, error)`, `Put([]byte) error` (1 byte to 16 KB), `Delete() error` (succeeds whether or
   not one existed).
 - With no Vault installed (`/mnt/mmc/.vault/q2-vault` missing) the calls return `ErrNoVault` at once. With
-  it installed but not answering, they retry every 250 ms for up to 5 s (it may be starting), then return
-  `ErrNoVault`.
+  it installed but not answering, they retry every 250 ms for up to 5 s while its launcher runs
+  (`/tmp/q2-vault` names a live pid: it may be starting), then return `ErrNoVault`; with no launcher
+  running, `ErrNoVault` at once.
+- **`ErrNoVault` while the Vault is installed means "not now"** (it is closed: on firmware without
+  `needs=` it starts with Wi-Fi or its row). Keep the plain file, don't move it in, and if it was a
+  `Delete` (Sign Out), try the `Delete` again later so no login stays sealed on the card.
 
 | Error | Meaning | What to do |
 |---|---|---|
 | `ErrNone` | nothing saved | sign in, then `Put` the token |
 | `ErrCardAway` | the card is not mounted | keep what you hold in memory; ask again later |
-| `ErrNoVault`, `ErrUnavailable` | no Vault, or it closed the connection with no answer (temporary) | use your own plain file as before; try the Vault again later |
+| `ErrNoVault`, `ErrUnavailable` | no Vault, the Vault not running now, or it closed the connection with no answer (temporary) | use your own plain file as before; don't migrate; try the Vault (and a pending `Delete`) again later |
 | `ErrNotVault` | something else owns the socket | use your own plain file, warn, and never migrate into it or delete the plain file |
 | `ErrRefused`, `ErrTooLarge`, `ErrBadRequest` | a bug, or an app the Vault doesn't know | don't retry |
 
