@@ -188,8 +188,13 @@ ignores it; the Vault still works through `wifi=1` and its row.
 - The key is in internal storage, root only. A root shell or a flash dump reads it.
 - An app that overwrites another app's binary on the card (`.plex/q2-plex`) would be handed that app's login at
   its next start. Later: the App Store records each binary's hash at install, and the Vault answers only a match.
-- A process that connects and then runs another app's binary in its place reaches that binary's code, not its
-  secret; noted as a limit, not a hole.
+- A malicious app already installed can race for another app's login: it connects, keeps the connection in a
+  forked child, then runs the other app's binary in its own process, so the Vault sees that app. There is no cheap
+  complete fix while all card apps share uid 1000 (the same uid can also read an app's memory unless the app sets
+  `prctl(PR_SET_DUMPABLE, 0)`). The Vault protects logins from the card being read elsewhere, not from a hostile app
+  on the Q2.
+- While the Vault isn't running, another app could listen on its socket path; the client library therefore checks
+  that the socket's owner is root (uid 0) before sending a login.
 - Swapping cards: the other card's logins stay on that card; on this one, apps sign in again.
 - Logins only.
 
