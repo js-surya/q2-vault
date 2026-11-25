@@ -1,4 +1,4 @@
-// Copied from q2-tailscale/internal/q2spot (same author, MIT), unchanged.
+// Copied from q2-tailscale/internal/q2spot (same author, MIT); q2-vault adds ServeListener only.
 // Package q2spot serves a card app's pages to Q2 Pod over Q2SPOT/1 (q2-pod docs/librespot.md, "Browsing
 // protocol"): a Unix stream socket, one request per connection. The client writes
 //
@@ -199,6 +199,12 @@ func Serve(ctx context.Context, socket string, h Handler) error {
 	if err != nil {
 		return err
 	}
+	return ServeListener(ctx, l, h)
+}
+
+// ServeListener is Serve on a socket the caller has bound (q2-vault: its mode set by the caller's
+// umask); it closes l when ctx ends.
+func ServeListener(ctx context.Context, l net.Listener, h Handler) error {
 	go func() { <-ctx.Done(); l.Close() }()
 	for {
 		c, err := l.Accept()
