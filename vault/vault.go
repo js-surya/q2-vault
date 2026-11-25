@@ -3,8 +3,9 @@
 // /tmp/q2-vault.sock. It uses only the standard library and imports nothing
 // from the rest of q2-vault, so an app maker can copy this directory as is.
 //
-// The client works only on Linux (the Q2): elsewhere every call returns
-// ErrNotVault, because it cannot check who owns the socket.
+// The client works only on Linux (the Q2): elsewhere every call that reaches
+// the socket returns ErrNotVault, because it cannot check who owns the socket
+// (a missing install still gives ErrNoVault first).
 //
 // How an app uses it:
 //
