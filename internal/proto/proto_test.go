@@ -54,7 +54,12 @@ func withCard(t *testing.T) string {
 	t.Helper()
 	old := cardRoot
 	cardRoot = t.TempDir()
-	t.Cleanup(func() { cardRoot = old })
+	// A fixed fake mount namespace for "us", so the result is the same on
+	// macOS and on Linux (where the real /proc/self/ns/mnt is readable).
+	oldNS := selfNS
+	selfNS = filepath.Join(t.TempDir(), "mnt")
+	os.Symlink("mnt:[1]", selfNS)
+	t.Cleanup(func() { cardRoot, selfNS = old, oldNS })
 	return cardRoot
 }
 
@@ -72,6 +77,11 @@ func fakeProc(t *testing.T, pid int, target string) string {
 	d := filepath.Join(root, strconv.Itoa(pid))
 	os.MkdirAll(d, 0o755)
 	if err := os.Symlink(target, filepath.Join(d, "exe")); err != nil {
+		t.Fatal(err)
+	}
+	// The fake process shares our fake mount namespace.
+	os.MkdirAll(filepath.Join(d, "ns"), 0o755)
+	if err := os.Symlink("mnt:[1]", filepath.Join(d, "ns", "mnt")); err != nil {
 		t.Fatal(err)
 	}
 	return root
@@ -137,7 +147,8 @@ func TestAppIDInode(t *testing.T) {
 func TestAppIDNSFailClosed(t *testing.T) {
 	R := withCard(t)
 	touch(t, R+"/.plex/q2-plex")
-	root := fakeProc(t, 7, R+"/.plex/q2-plex") // peer has no ns/mnt
+	root := fakeProc(t, 7, R+"/.plex/q2-plex")
+	os.RemoveAll(filepath.Join(root, "7", "ns")) // peer's ns/mnt unreadable
 	self := filepath.Join(t.TempDir(), "mnt")
 	os.Symlink("mnt:[1]", self)
 	old := selfNS
@@ -164,7 +175,7 @@ func TestAppIDMountNS(t *testing.T) {
 	R := withCard(t)
 	touch(t, R+"/.plex/q2-plex")
 	root := fakeProc(t, 7, R+"/.plex/q2-plex")
-	os.MkdirAll(filepath.Join(root, "7", "ns"), 0o755)
+	os.Remove(filepath.Join(root, "7", "ns", "mnt"))
 	os.Symlink("mnt:[2]", filepath.Join(root, "7", "ns", "mnt"))
 	self := filepath.Join(t.TempDir(), "mnt")
 	os.Symlink("mnt:[1]", self)
