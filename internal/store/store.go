@@ -122,6 +122,10 @@ func (s *Store) Put(id string, secret []byte) error {
 	if err := os.Mkdir(s.Dir, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
 		return err
 	}
+	// A narrow umask (the socket window) can leave the folder without x bits.
+	if err := os.Chmod(s.Dir, 0o700); err != nil {
+		return err
+	}
 	return writeAtomic(s.path(id), blob, 0o600)
 }
 

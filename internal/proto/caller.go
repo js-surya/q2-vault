@@ -28,6 +28,7 @@ func AppID(procRoot string, pid int) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	orig := exe
 	deleted := strings.HasSuffix(exe, " (deleted)")
 	exe = strings.TrimSuffix(exe, " (deleted)") // updated while running
 	rest, ok := strings.CutPrefix(exe, cardRoot+"/.")
@@ -41,10 +42,16 @@ func AppID(procRoot string, pid int) (string, error) {
 	// The path alone can be faked from a private mount namespace (an app
 	// mounting its own file there). (a) Same mount namespace as the Vault, if
 	// the kernel shows them; (b) the running inode is the real card file.
-	theirs, e1 := os.Readlink(filepath.Join(procRoot, strconv.Itoa(pid), "ns", "mnt"))
 	ours, e2 := os.Readlink(selfNS)
-	if e1 == nil && e2 == nil && theirs != ours {
-		return "", errors.New("proto: other mount namespace")
+	if e2 == nil { // else a kernel without ns files: the inode check below
+		theirs, e1 := os.Readlink(filepath.Join(procRoot, strconv.Itoa(pid), "ns", "mnt"))
+		if e1 != nil || theirs != ours { // fail closed: an unreadable peer is refused
+			return "", errors.New("proto: other or unreadable mount namespace")
+		}
+	}
+	// The pid must not have been replaced while we looked.
+	if again, err := os.Readlink(filepath.Join(procRoot, strconv.Itoa(pid), "exe")); err != nil || again != orig {
+		return "", errors.New("proto: caller changed while checked")
 	}
 	if !deleted {
 		got, err := exeStat(filepath.Join(procRoot, strconv.Itoa(pid), "exe"))

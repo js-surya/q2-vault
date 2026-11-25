@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -298,5 +299,19 @@ func TestCutOffWriteKeepsOldFile(t *testing.T) {
 	got, err := s.Get("plex")
 	if err != nil || string(got) != "old" {
 		t.Fatalf("%q %v", got, err)
+	}
+}
+
+func TestPutFolderIs0700UnderNarrowUmask(t *testing.T) {
+	s := newStore(t, true)
+	old := syscall.Umask(0o111)
+	err := s.Put("plex", []byte("tok"))
+	syscall.Umask(old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(s.Dir)
+	if err != nil || fi.Mode().Perm() != 0o700 {
+		t.Fatalf("folder mode %v %v", fi.Mode().Perm(), err)
 	}
 }

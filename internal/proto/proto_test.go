@@ -134,6 +134,32 @@ func TestAppIDInode(t *testing.T) {
 	}
 }
 
+func TestAppIDNSFailClosed(t *testing.T) {
+	R := withCard(t)
+	touch(t, R+"/.plex/q2-plex")
+	root := fakeProc(t, 7, R+"/.plex/q2-plex") // peer has no ns/mnt
+	self := filepath.Join(t.TempDir(), "mnt")
+	os.Symlink("mnt:[1]", self)
+	old := selfNS
+	t.Cleanup(func() { selfNS = old })
+	selfNS = self
+	if id, err := AppID(root, 7); err == nil {
+		t.Errorf("unreadable peer namespace accepted as %q", id)
+	}
+	selfNS = filepath.Join(t.TempDir(), "none") // kernel without ns files
+	if id, err := AppID(root, 7); err != nil || id != "plex" {
+		t.Errorf("fallback to inode check: %q %v", id, err)
+	}
+	// ...and the inode check still bites in that fallback.
+	touch(t, R+"/elsewhere")
+	oldS := exeStat
+	t.Cleanup(func() { exeStat = oldS })
+	exeStat = func(string) (os.FileInfo, error) { return os.Stat(R + "/elsewhere") }
+	if _, err := AppID(root, 7); err == nil {
+		t.Error("inode mismatch accepted in fallback")
+	}
+}
+
 func TestAppIDMountNS(t *testing.T) {
 	R := withCard(t)
 	touch(t, R+"/.plex/q2-plex")
@@ -367,6 +393,9 @@ func TestServeSlowClient(t *testing.T) {
 func TestServeOneVaultOnly(t *testing.T) {
 	f := &fake{data: map[string][]byte{}}
 	sock := start(t, f, "plex", nil, nil)
+	oldO := ownerIsRoot
+	ownerIsRoot = func(os.FileInfo) bool { return true } // the test can't be root
+	t.Cleanup(func() { ownerIsRoot = oldO })
 	err := Serve(context.Background(), sock, f, "/proc", nil)
 	if err == nil {
 		t.Fatal("second Serve on a live socket should fail")
@@ -379,9 +408,10 @@ func TestServeOneVaultOnly(t *testing.T) {
 func TestServeLeavesReplacedSocket(t *testing.T) {
 	f := &fake{data: map[string][]byte{}}
 	var cancel context.CancelFunc
+	oldA, oldP := appID, peerPID
 	appID = func(string, int) (string, error) { return "plex", nil }
 	peerPID = func(*net.UnixConn) (int, error) { return 1, nil }
-	t.Cleanup(func() { appID, peerPID = AppID, peerPIDOS })
+	t.Cleanup(func() { appID, peerPID = oldA, oldP })
 	dir, _ := os.MkdirTemp("", "q2v")
 	t.Cleanup(func() { os.RemoveAll(dir) })
 	sock := filepath.Join(dir, "v.sock")
@@ -444,4 +474,49 @@ func TestOnUseForBadRequest(t *testing.T) {
 	if len(used) == 0 {
 		t.Error("onUse not called for a bad request from an app")
 	}
+}
+
+func TestServeRemovesSquatterSocket(t *testing.T) {
+	dir, _ := os.MkdirTemp("", "q2v")
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "v.sock")
+	squat, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer squat.Close()
+	go func() {
+		for {
+			c, err := squat.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+	oldO := ownerIsRoot
+	t.Cleanup(func() { ownerIsRoot = oldO })
+	ownerIsRoot = func(os.FileInfo) bool { return false } // owned by someone else
+	// With a root-owned live socket it must refuse instead.
+	ownerIsRoot = func(os.FileInfo) bool { return true }
+	if err := Serve(context.Background(), sock, &fake{}, "/proc", nil); err == nil {
+		t.Fatal("a live root-owned socket should stop Serve")
+	}
+	ownerIsRoot = func(os.FileInfo) bool { return false }
+	oldA, oldP := appID, peerPID
+	appID = func(string, int) (string, error) { return "plex", nil }
+	peerPID = func(*net.UnixConn) (int, error) { return 1, nil }
+	t.Cleanup(func() { appID, peerPID = oldA, oldP })
+	f := &fake{data: map[string][]byte{}}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- Serve(ctx, sock, f, "/proc", nil) }()
+	t.Cleanup(func() { cancel(); <-done })
+	for i := 0; i < 200; i++ {
+		if got := ask(t, sock, []byte("Q2VAULT/1\nget\n")); string(got) == "Q2VAULT/1\nnone\n" {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("Serve did not take the squatted path")
 }

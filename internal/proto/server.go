@@ -29,6 +29,12 @@ const (
 	drainMax   = 4 << 20
 )
 
+// ownerIsRoot says whether a file belongs to uid 0; a variable for tests.
+var ownerIsRoot = func(fi os.FileInfo) bool {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	return ok && st.Uid == 0
+}
+
 // Hooks for tests; production uses the kernel and /proc.
 var (
 	appID   = AppID
@@ -40,10 +46,14 @@ var (
 // is the boundary. One request per connection, a 5 s deadline, and onUse(id)
 // for each request answered for an app.
 func Serve(ctx context.Context, socket string, b Backend, procRoot string, onUse func(id string)) error {
-	// Another Vault answering on the socket is not ours to remove.
+	// A live socket owned by root is another Vault: not ours to remove. One
+	// owned by anyone else was bound by an app while the Vault was down
+	// (squatting): it goes, and we take the path.
 	if c, err := net.DialTimeout("unix", socket, time.Second); err == nil {
 		c.Close()
-		return errors.New("proto: another Vault is already listening")
+		if fi, err := os.Lstat(socket); err == nil && fi.Mode()&os.ModeSocket != 0 && ownerIsRoot(fi) {
+			return errors.New("proto: another Vault is already listening")
+		}
 	}
 	os.Remove(socket) // a dead socket from a crash
 	// Created 0666 directly: no window, and no chmod by path.
