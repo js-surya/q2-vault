@@ -50,37 +50,59 @@ func TestEncode(t *testing.T) {
 	}
 }
 
-func TestAppID(t *testing.T) {
-	root := t.TempDir()
-	link := func(pid int, target string) {
-		d := filepath.Join(root, strconv.Itoa(pid))
-		os.MkdirAll(d, 0o755)
-		if err := os.Symlink(target, filepath.Join(d, "exe")); err != nil {
-			t.Fatal(err)
-		}
+func withCard(t *testing.T) string {
+	t.Helper()
+	old := cardRoot
+	cardRoot = t.TempDir()
+	t.Cleanup(func() { cardRoot = old })
+	return cardRoot
+}
+
+func touch(t *testing.T, path string) {
+	t.Helper()
+	os.MkdirAll(filepath.Dir(path), 0o755)
+	if err := os.WriteFile(path, []byte("x"), 0o755); err != nil {
+		t.Fatal(err)
 	}
+}
+
+func fakeProc(t *testing.T, pid int, target string) string {
+	t.Helper()
+	root := t.TempDir()
+	d := filepath.Join(root, strconv.Itoa(pid))
+	os.MkdirAll(d, 0o755)
+	if err := os.Symlink(target, filepath.Join(d, "exe")); err != nil {
+		t.Fatal(err)
+	}
+	return root
+}
+
+func TestAppID(t *testing.T) {
+	R := withCard(t)
+	touch(t, R+"/.plex/q2-plex")
+	touch(t, R+"/.my-app-1/q2-my-app-1")
 	cases := []struct {
 		target string
 		id     string
 		ok     bool
 	}{
-		{"/mnt/mmc/.plex/q2-plex", "plex", true},
-		{"/mnt/mmc/.plex/q2-plex (deleted)", "plex", true},
-		{"/mnt/mmc/.my-app-1/q2-my-app-1", "my-app-1", true},
-		{"/mnt/mmc/.plex/q2-other", "", false},
-		{"/mnt/mmc/.vault/q2-vault", "", false},
+		{R + "/.plex/q2-plex", "plex", true},
+		{R + "/.plex/q2-plex (deleted)", "plex", true},
+		{R + "/.my-app-1/q2-my-app-1", "my-app-1", true},
+		{R + "/.plex/q2-other", "", false},
+		{R + "/.vault/q2-vault", "", false},
 		{"/usr/bin/sh", "", false},
-		{"/mnt/mmc/.Plex/q2-Plex", "", false},
-		{"/mnt/mmc/.a/b/q2-b", "", false},
-		{"/mnt/mmc/.abcdefghijklmnop/q2-abcdefghijklmnop", "", false},
-		{"/mnt/mmc/../mmc/.plex/q2-plex", "", false},
-		{"/mnt/mmc/.plex/q2-plex/", "", false},
-		{"/mnt/mmc/./q2-", "", false},
+		{R + "/.Plex/q2-Plex", "", false},
+		{R + "/.a/b/q2-b", "", false},
+		{R + "/.abcdefghijklmnop/q2-abcdefghijklmnop", "", false},
+		{R + "/../" + filepath.Base(R) + "/.plex/q2-plex", "", false},
+		{R + "/.plex/q2-plex/", "", false},
+		{R + "/./q2-", "", false},
 	}
-	for i, c := range cases {
-		pid := 100 + i
-		link(pid, c.target)
-		id, err := AppID(root, pid)
+	touch(t, R+"/.vault/q2-vault")
+	for _, c := range cases {
+		root := fakeProc(t, 100, c.target)
+		id, err := AppID(root, 100)
 		if c.ok && (err != nil || id != c.id) {
 			t.Errorf("%q: %q %v", c.target, id, err)
 		}
@@ -88,8 +110,48 @@ func TestAppID(t *testing.T) {
 			t.Errorf("%q should be refused, got %q", c.target, id)
 		}
 	}
-	if _, err := AppID(root, 99999); err == nil {
+	if _, err := AppID(t.TempDir(), 99999); err == nil {
 		t.Error("missing pid should fail")
+	}
+}
+
+func TestAppIDInode(t *testing.T) {
+	R := withCard(t)
+	touch(t, R+"/.plex/q2-plex")
+	touch(t, R+"/elsewhere")
+	root := fakeProc(t, 7, R+"/.plex/q2-plex")
+	// A private mount put another file at the same path: stat of the running
+	// exe resolves to a different inode than the card's canonical file.
+	old := exeStat
+	t.Cleanup(func() { exeStat = old })
+	exeStat = func(string) (os.FileInfo, error) { return os.Stat(R + "/elsewhere") }
+	if id, err := AppID(root, 7); err == nil {
+		t.Errorf("different inode accepted as %q", id)
+	}
+	exeStat = func(string) (os.FileInfo, error) { return os.Stat(R + "/.plex/q2-plex") }
+	if id, err := AppID(root, 7); err != nil || id != "plex" {
+		t.Errorf("same inode: %q %v", id, err)
+	}
+}
+
+func TestAppIDMountNS(t *testing.T) {
+	R := withCard(t)
+	touch(t, R+"/.plex/q2-plex")
+	root := fakeProc(t, 7, R+"/.plex/q2-plex")
+	os.MkdirAll(filepath.Join(root, "7", "ns"), 0o755)
+	os.Symlink("mnt:[2]", filepath.Join(root, "7", "ns", "mnt"))
+	self := filepath.Join(t.TempDir(), "mnt")
+	os.Symlink("mnt:[1]", self)
+	old := selfNS
+	t.Cleanup(func() { selfNS = old })
+	selfNS = self
+	if id, err := AppID(root, 7); err == nil {
+		t.Errorf("other mount namespace accepted as %q", id)
+	}
+	os.Remove(self)
+	os.Symlink("mnt:[2]", self)
+	if id, err := AppID(root, 7); err != nil || id != "plex" {
+		t.Errorf("same namespace: %q %v", id, err)
 	}
 }
 
@@ -299,5 +361,87 @@ func TestServeSlowClient(t *testing.T) {
 	}
 	if got := ask(t, sock, []byte("Q2VAULT/1\nget\n")); string(got) != "Q2VAULT/1\nnone\n" {
 		t.Errorf("after: %q", got)
+	}
+}
+
+func TestServeOneVaultOnly(t *testing.T) {
+	f := &fake{data: map[string][]byte{}}
+	sock := start(t, f, "plex", nil, nil)
+	err := Serve(context.Background(), sock, f, "/proc", nil)
+	if err == nil {
+		t.Fatal("second Serve on a live socket should fail")
+	}
+	if got := ask(t, sock, []byte("Q2VAULT/1\nget\n")); string(got) != "Q2VAULT/1\nnone\n" {
+		t.Errorf("first Vault damaged: %q", got)
+	}
+}
+
+func TestServeLeavesReplacedSocket(t *testing.T) {
+	f := &fake{data: map[string][]byte{}}
+	var cancel context.CancelFunc
+	appID = func(string, int) (string, error) { return "plex", nil }
+	peerPID = func(*net.UnixConn) (int, error) { return 1, nil }
+	t.Cleanup(func() { appID, peerPID = AppID, peerPIDOS })
+	dir, _ := os.MkdirTemp("", "q2v")
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "v.sock")
+	var ctx context.Context
+	ctx, cancel = context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- Serve(ctx, sock, f, "/proc", nil) }()
+	for i := 0; i < 200; i++ {
+		if c, err := net.Dial("unix", sock); err == nil {
+			c.Close()
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	os.Remove(sock)
+	os.WriteFile(sock, []byte("not ours"), 0o600)
+	cancel()
+	<-done
+	if b, err := os.ReadFile(sock); err != nil || string(b) != "not ours" {
+		t.Errorf("another file at the path was removed: %v", err)
+	}
+}
+
+func TestServePerCallerCap(t *testing.T) {
+	f := &fake{data: map[string][]byte{}}
+	var used []string
+	var mu sync.Mutex
+	sock := start(t, f, "plex", &used, &mu)
+	var held []net.Conn
+	for i := 0; i < maxPerApp; i++ {
+		c, err := net.Dial("unix", sock)
+		if err != nil {
+			t.Fatal(err)
+		}
+		held = append(held, c)
+		defer c.Close()
+	}
+	time.Sleep(200 * time.Millisecond) // let the server take them
+	start := time.Now()
+	if got := ask(t, sock, []byte("Q2VAULT/1\nget\n")); len(got) != 0 || time.Since(start) > 2*time.Second {
+		t.Errorf("over the cap: %q after %v", got, time.Since(start))
+	}
+	for _, c := range held {
+		c.Close()
+	}
+	time.Sleep(200 * time.Millisecond)
+	if got := ask(t, sock, []byte("Q2VAULT/1\nget\n")); string(got) != "Q2VAULT/1\nnone\n" {
+		t.Errorf("after release: %q", got)
+	}
+}
+
+func TestOnUseForBadRequest(t *testing.T) {
+	f := &fake{data: map[string][]byte{}}
+	var used []string
+	var mu sync.Mutex
+	sock := start(t, f, "plex", &used, &mu)
+	ask(t, sock, []byte("garbage"))
+	mu.Lock()
+	defer mu.Unlock()
+	if len(used) == 0 {
+		t.Error("onUse not called for a bad request from an app")
 	}
 }
