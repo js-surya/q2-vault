@@ -84,6 +84,7 @@ func TestRemoveAsksFirst(t *testing.T) {
 		t.Fatalf("%v", r.removed)
 	}
 	// another op disarms
+	r.h("about", nil)
 	r.h(rm.URI, []string{"plex"}) // armed
 	r.h("about", nil)
 	if rep := r.h(rm.URI, []string{"plex"}); rep.Message != "Press again to remove" || len(r.removed) != 1 {
