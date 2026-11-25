@@ -28,6 +28,8 @@ const (
 	maxPerApp  = 4
 	deadline   = 5 * time.Second
 	drainMax   = 4 << 20
+	// refusedDrain bounds the read of a refused caller's request: a client has written it by then.
+	refusedDrain = time.Second
 )
 
 // ownerIsRoot says whether a file belongs to uid 0; a variable for tests.
@@ -213,6 +215,10 @@ func handle(c *net.UnixConn, b Backend, procRoot string, onUse func(string), pc 
 	}
 	if err != nil {
 		reply(c, StatusRefused, nil)
+		// Read what the caller sent (1 s at most) before closing: on Linux, closing with its
+		// request unread resets the connection, and the caller loses the answer.
+		c.SetReadDeadline(time.Now().Add(refusedDrain))
+		drain(c)
 		return
 	}
 
