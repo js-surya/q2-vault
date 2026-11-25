@@ -4,6 +4,23 @@ A card app for the Shanling Q2 running [Q2 Pod](https://github.com/DiamondBond/q
 card apps' logins sealed on the SD card. The one key is in the Q2's internal storage, and each app gets
 back only its own login, over a Unix socket. It comes with a small Go package, `vault`, for app makers.
 
+<p>
+  <img src="docs/screenshots/vault.png" width="300" alt="The Vault's page: running, one saved login (Tailscale), Erase All Logins, About">
+  <img src="docs/screenshots/login.png" width="300" alt="A saved login: when it was saved, and Remove">
+</p>
+<p>
+  <img src="docs/screenshots/apps.png" width="300" alt="Library → Apps, with the Vault's row">
+  <img src="docs/screenshots/about.png" width="300" alt="About: version, made by, thanks">
+</p>
+
+## Apps that use it
+
+- [**Tailscale**](https://github.com/js-surya/q2-tailscale) (q2-v0.8 and later): its HTTPS certificate's
+  private keys and its log key go into the Vault, and its working folder moves to RAM, so nothing of it
+  but received files stays on the card. Its login stays in the Q2's internal storage.
+
+Your app can too: see [For app makers](#for-app-makers).
+
 ## What it does
 
 Card apps keep their logins as plain files on the SD card (a Jellyfin or Plex token, a Deezer cookie,
@@ -139,8 +156,17 @@ closed.
 
 ## Install
 
-From the Q2: **System settings → App Store**, once the Vault is listed there. Or unzip a release's
-`q2-vault-vX.Y-SHA.zip` at the root of the card. Its row is in **Library → Apps**.
+Unzip the [latest release](https://github.com/js-surya/q2-vault/releases/latest)'s
+`q2-vault-vX.Y-SHA.zip` at the root of the card (it makes the `.vault` folder), or install it from
+**System settings → App Store** once it's listed there. Its row is in **Library → Apps**.
+
+Tested on a Shanling Q2 with Q2 Pod 1.9.3 (Vault started with Wi-Fi) and a 1.9.4 dev build with
+`needs=` (started before each app that needs it, closed itself when unused).
+
+## Design
+
+[docs/design.md](docs/design.md): the file format, the keys, the protocol, how the caller is identified,
+and the reasons for each choice.
 
 ## Build
 
