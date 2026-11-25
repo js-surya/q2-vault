@@ -29,8 +29,15 @@
 //
 // Fallback: with no Vault installed (ErrNoVault) keep using your own plain
 // file. Get, Put and Delete answer ErrNoVault at once when the Vault is not
-// installed; when it is installed but the socket does not answer, they retry
-// every 250 ms for up to 5 s (it may be starting) and then return ErrNoVault.
+// installed. When it is installed but the socket does not answer, they retry
+// every 250 ms for up to 5 s while its launcher runs (/tmp/q2-vault names a
+// live pid: it may be starting), then return ErrNoVault; with no launcher
+// running they return ErrNoVault at once.
+//
+// ErrNoVault while the Vault is installed means "not now": the Vault is
+// closed (on firmware without needs=, it starts with Wi-Fi or its row). Keep
+// your plain file, don't move it in, and if you meant to Delete (Sign Out),
+// try the Delete again later, so no login stays sealed on the card.
 //
 // Moving an old plain file in: at start, when a Vault is there and an old
 // plain login file exists, Put its contents, Get the secret back and compare
@@ -53,11 +60,15 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 )
 
 var (
-	// ErrNoVault: the Vault is not installed, or never answered within the retry.
+	// ErrNoVault: the Vault is not installed, or not running (no live launcher),
+	// or never answered within the retry. With the Vault installed it means
+	// "not now": keep your plain file, don't migrate, retry a Delete later.
 	ErrNoVault = errors.New("vault: no Vault")
 	// ErrNone: the app has no saved login.
 	ErrNone = errors.New("vault: nothing saved")
@@ -80,6 +91,9 @@ var (
 var (
 	Socket    = "/tmp/q2-vault.sock"
 	Installed = "/mnt/mmc/.vault/q2-vault"
+	// PidFile is where the Vault's launcher keeps its pid while it runs; ProcRoot is /proc.
+	PidFile  = "/tmp/q2-vault"
+	ProcRoot = "/proc"
 
 	retryEvery = 250 * time.Millisecond
 	retryFor   = 5 * time.Second
@@ -126,12 +140,35 @@ func do(op string, body []byte) ([]byte, error) {
 		if err == nil {
 			return exchange(c.(*net.UnixConn), op, body)
 		}
+		if !launcherRunning() {
+			return nil, ErrNoVault // nothing is starting it: not now
+		}
 		left := time.Until(deadline)
 		if left <= 0 {
 			return nil, ErrNoVault
 		}
 		time.Sleep(min(retryEvery, left))
 	}
+}
+
+// launcherRunning reports whether PidFile holds a decimal pid whose ProcRoot/<pid> exists: the
+// Vault's launcher is running, so the Vault may be starting.
+func launcherRunning() bool {
+	b, err := os.ReadFile(PidFile)
+	if err != nil {
+		return false
+	}
+	pid := strings.TrimSpace(string(b))
+	if pid == "" || len(pid) > 10 {
+		return false
+	}
+	for _, r := range pid {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	_, err = os.Stat(filepath.Join(ProcRoot, pid))
+	return err == nil
 }
 
 func exchange(c *net.UnixConn, op string, body []byte) ([]byte, error) {

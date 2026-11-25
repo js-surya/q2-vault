@@ -22,14 +22,33 @@ func setup(t *testing.T) (sock, installed string) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
-	oS, oI, oP, oE, oF := Socket, Installed, peerUID, retryEvery, retryFor
+	oS, oI, oP, oE, oF, oL, oR := Socket, Installed, peerUID, retryEvery, retryFor, PidFile, ProcRoot
 	Socket = filepath.Join(dir, "s")
 	Installed = filepath.Join(dir, "q2-vault")
+	PidFile = filepath.Join(dir, "q2-vault.pid")
+	ProcRoot = filepath.Join(dir, "proc")
 	peerUID = func(*net.UnixConn) (uint32, error) { return 0, nil }
 	retryEvery, retryFor = 20*time.Millisecond, 300*time.Millisecond
-	t.Cleanup(func() { Socket, Installed, peerUID, retryEvery, retryFor = oS, oI, oP, oE, oF })
+	t.Cleanup(func() {
+		Socket, Installed, peerUID, retryEvery, retryFor, PidFile, ProcRoot = oS, oI, oP, oE, oF, oL, oR
+	})
 	install(t)
+	launcher(t, "4242\n", true) // the Vault's launcher is running: it may be starting
 	return Socket, Installed
+}
+
+// launcher writes the launcher's pid file and makes /proc/4242 exist or not.
+func launcher(t *testing.T, pidFile string, alive bool) {
+	t.Helper()
+	if err := os.WriteFile(PidFile, []byte(pidFile), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(ProcRoot, "4242")
+	if alive {
+		os.MkdirAll(p, 0o755)
+	} else {
+		os.RemoveAll(p)
+	}
 }
 
 func install(t *testing.T) {
@@ -200,8 +219,58 @@ func TestNeverStarts(t *testing.T) {
 	}
 }
 
+func TestInstalledButNotRunningIsImmediate(t *testing.T) {
+	// Installed, but no live launcher: not now. Nothing is coming, so no wait.
+	cases := []struct {
+		name, pid string
+		alive     bool
+		noFile    bool
+	}{
+		{"no pid file", "", false, true},
+		{"dead pid", "4242\n", false, false},
+		{"empty", "", true, false},
+		{"not decimal", "42a\n", true, false},
+		{"signed", "+4242\n", true, false},
+		{"two", "4242 4242\n", true, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			setup(t)
+			launcher(t, c.pid, c.alive)
+			if c.noFile {
+				os.Remove(PidFile)
+			}
+			retryFor = 2 * time.Second
+			start := time.Now()
+			if _, err := Get(); !errors.Is(err, ErrNoVault) {
+				t.Fatal(err)
+			}
+			if time.Since(start) > 100*time.Millisecond {
+				t.Fatalf("waited %v with no live launcher", time.Since(start))
+			}
+		})
+	}
+}
+
+func TestRetryStopsWhenTheLauncherEnds(t *testing.T) {
+	setup(t)
+	retryFor = 3 * time.Second
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		os.RemoveAll(filepath.Join(ProcRoot, "4242"))
+	}()
+	start := time.Now()
+	if _, err := Get(); !errors.Is(err, ErrNoVault) {
+		t.Fatal(err)
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("kept retrying %v after the launcher ended", d)
+	}
+}
+
 func TestDefaults(t *testing.T) {
-	if Socket != "/tmp/q2-vault.sock" || Installed != "/mnt/mmc/.vault/q2-vault" {
+	if Socket != "/tmp/q2-vault.sock" || Installed != "/mnt/mmc/.vault/q2-vault" ||
+		PidFile != "/tmp/q2-vault" || ProcRoot != "/proc" {
 		t.Fatal("paths")
 	}
 	if retryEvery != 250*time.Millisecond || retryFor != 5*time.Second {
@@ -277,6 +346,9 @@ func TestEmptyOkGetIsUnavailable(t *testing.T) {
 }
 
 func TestDefaultHookFailsClosedOffLinux(t *testing.T) {
+	if runtime.GOOS == "linux" {
+		t.Skip("Linux reads the peer's credentials (peer_linux_test.go)")
+	}
 	if _, err := osPeerUID(nil); runtime.GOOS != "linux" && err == nil {
 		t.Fatal("must fail closed")
 	}
