@@ -132,8 +132,7 @@ func run(ctx context.Context, cfg config) error {
 	if err := st.Clean(); err != nil {
 		logf("clean: %v", err)
 	}
-	var missMu sync.Mutex
-	missingNow := sweep(st, cfg)
+	missingNow := sweep(st, cfg) // written once, here; the page only reads it
 
 	tracker := &idle.Tracker{Now: cfg.Now}
 	tracker.Seen()
@@ -147,8 +146,6 @@ func run(ctx context.Context, cfg config) error {
 		List:  st.List,
 		Names: nm.Get,
 		Missing: func() map[string]time.Time {
-			missMu.Lock()
-			defer missMu.Unlock()
 			out := make(map[string]time.Time, len(missingNow))
 			for id, t := range missingNow {
 				out[id] = t
@@ -188,20 +185,17 @@ func run(ctx context.Context, cfg config) error {
 	defer scancel()
 	vaultDone := make(chan error, 1)
 	go func() { vaultDone <- cfg.Serve(sctx, cfg.Socket, st, cfg.Proc, func(string) { tracker.Seen() }) }()
-	pageDone := make(chan struct{})
-	go func() {
-		defer close(pageDone)
-		if err := q2spot.Serve(sctx, cfg.Browse, page); err != nil {
-			logf("page socket: %v", err)
-		}
-	}()
+	pageDone := make(chan error, 1) // nil once stopped; an error when it couldn't start or failed
+	go func() { pageDone <- q2spot.Serve(sctx, cfg.Browse, page) }()
 
 	users := idle.Users(cfg.Card, cfg.Sealed)
 	usersAt := cfg.Now()
+	want := filepath.Join(cfg.Tmp, "q2-vault.want") // touched by the launcher when asked to start again
+	lastTick := cfg.Now()
 	tick := time.NewTicker(cfg.Tick)
 	defer tick.Stop()
 	var serveErr error
-	served := false
+	served, paged := false, false
 loop:
 	for {
 		select {
@@ -218,10 +212,24 @@ loop:
 			}
 			serveErr = fmt.Errorf("vault socket: %w", serveErr)
 			break loop
+		case err := <-pageDone:
+			// A Vault without its page can't be seen or erased: fail, and the launcher starts it again.
+			paged = true
+			if err == nil {
+				err = errors.New("stopped serving")
+			}
+			serveErr = fmt.Errorf("page socket: %w", err)
+			break loop
 		case <-tick.C:
-			if now := cfg.Now(); now.Sub(usersAt) >= usersEvery || now.Before(usersAt) {
+			now := cfg.Now()
+			if now.Sub(usersAt) >= usersEvery || now.Before(usersAt) {
 				users, usersAt = idle.Users(cfg.Card, cfg.Sealed), now
 			}
+			// An app's start ran the launcher while the Vault was about to close: stay.
+			if wanted(want, lastTick) {
+				tracker.Seen()
+			}
+			lastTick = now
 			for _, id := range users {
 				if cfg.running(cfg.Tmp, id) {
 					tracker.Seen()
@@ -235,14 +243,20 @@ loop:
 		}
 	}
 
-	// Stop serving; requests in progress (a write among them) finish first.
+	// Stop serving; requests in progress (a write among them) finish first. Each has a 5 s deadline,
+	// and the launcher KILLs the app 2 s after its TERM: a request cut off by the KILL leaves at most a
+	// <id>.sealed.tmp (writes are tmp + rename, never in place), which Clean removes at the next start.
 	scancel()
 	if !served {
 		if err := <-vaultDone; err != nil {
 			logf("vault socket: %v", err)
 		}
 	}
-	<-pageDone
+	if !paged {
+		if err := <-pageDone; err != nil {
+			logf("page socket: %v", err)
+		}
+	}
 	pageMu.Lock()
 	closing = true
 	pageMu.Unlock()
@@ -286,20 +300,34 @@ func sweep(st *store.Store, cfg config) map[string]time.Time {
 	return s.Missing
 }
 
+// storeErase is st.EraseAll; a hook so a test can take the card away at the worst moment.
+var storeErase = func(st *store.Store, k [32]byte) error { return st.EraseAll(k) }
+
 // eraseAll deletes every sealed login and puts a new master key in place, in memory and in keys/key.
-// The card's files go first: with the card away nothing changes.
+// The new key file is written first: a crash after it leaves old files that no longer open (each set
+// aside as .bad, its app signs in again), never logins sealed with a key that's lost. With the card
+// away nothing changes; with the key unwritable nothing changes.
 func eraseAll(st *store.Store, keys string, rand io.Reader) error {
+	if _, err := st.List(); err != nil { // the card mounted and readable
+		return err
+	}
 	var k [32]byte
 	defer clear(k[:])
 	if _, err := io.ReadFull(rand, k[:]); err != nil {
 		return err
 	}
-	err := st.EraseAll(k)
-	if st.Master != k { // not adopted (the card away): the old key stays, in memory and on file
-		return err
+	old := st.Master // only EraseAll writes it, and the caller serialises eraseAll
+	defer clear(old[:])
+	path := filepath.Join(keys, "key")
+	if err := writeKey(path, k); err != nil {
+		return fmt.Errorf("new key: %w", err)
 	}
-	if werr := writeKey(filepath.Join(keys, "key"), k); werr != nil {
-		return errors.Join(err, fmt.Errorf("new key: %w", werr))
+	err := storeErase(st, k)
+	if st.Master != k { // not adopted (the card went away): back to the old key, on file too
+		if werr := writeKey(path, old); werr != nil {
+			return errors.Join(err, fmt.Errorf("old key back: %w", werr))
+		}
+		return err
 	}
 	return err
 }
@@ -332,6 +360,12 @@ func writeKey(path string, k [32]byte) error {
 	}
 	defer d.Close()
 	return d.Sync()
+}
+
+// wanted reports whether the launcher touched path after since (the previous tick).
+func wanted(path string, since time.Time) bool {
+	fi, err := os.Stat(path)
+	return err == nil && fi.ModTime().After(since)
 }
 
 // keyRand reads from the hardware generator at hw, else (no such device, or it fails) the system's.

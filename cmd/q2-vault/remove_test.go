@@ -98,3 +98,42 @@ func TestNoWatchOnAShallowOrStrayPath(t *testing.T) {
 		t.Error("no watch for the real paths")
 	}
 }
+
+func TestAnUnreadableCardKeepsTheKey(t *testing.T) {
+	dir, keys, sealed, mounts := removeFixture(t, true) // still listed in the mounts
+	card := filepath.Dir(dir)
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	// The card pulled: its folder can't be read, though /proc/mounts hasn't caught up.
+	if err := os.Chmod(card, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(card, 0o755) })
+	if err := watchRemove(dir, keys, sealed, mounts, 3, "0.05").Run(); err != nil {
+		t.Fatal(err)
+	}
+	if !exists(filepath.Join(keys, "key")) {
+		t.Fatal("key deleted with the card unreadable")
+	}
+	os.Chmod(card, 0o755)
+	if !exists(filepath.Join(sealed, "plex.sealed")) {
+		t.Fatal("logins deleted with the card unreadable")
+	}
+}
+
+func TestNoSealedFolderKeepsTheKey(t *testing.T) {
+	dir, keys, sealed, mounts := removeFixture(t, true)
+	if err := os.RemoveAll(sealed); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := watchRemove(dir, keys, sealed, mounts, 3, "0.05").Run(); err != nil {
+		t.Fatal(err)
+	}
+	if !exists(filepath.Join(keys, "key")) {
+		t.Fatal("key deleted with no sealed folder on the card")
+	}
+}

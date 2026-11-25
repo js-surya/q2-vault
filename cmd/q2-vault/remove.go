@@ -15,11 +15,16 @@ import (
 // this watches the card folder for tries×gap seconds, and once it's gone with the card still mounted (a
 // Remove, not the card taken out or handed to USB storage, which take the folder with them) deletes the
 // key's folder and the sealed logins' folder too.
+//
+// A card pulled during the watch can make the app folder look gone while /proc/mounts still lists the
+// card, so every condition must hold at once: the card still readable, the sealed folder still on it,
+// the card still mounted, and the app folder gone. Anything else keeps both folders.
 const removeScript = `dir=$1 card=$2 keys=$3 sealed=$4 mounts=$5 tries=$6 gap=$7
 i=0
 while [ "$i" -lt "$tries" ]; do
 	if [ ! -e "$dir" ]; then
-		grep -q " $card " "$mounts" && rm -rf "$keys" "$sealed"
+		ls -a "$card" >/dev/null 2>&1 && [ -d "$sealed" ] && grep -q " $card " "$mounts" &&
+			[ ! -e "$dir" ] && rm -rf "$keys" "$sealed"
 		exit 0
 	fi
 	sleep "$gap"

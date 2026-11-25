@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	crand "crypto/rand"
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -14,6 +16,7 @@ import (
 
 	"q2-vault/internal/missing"
 	"q2-vault/internal/proto"
+	"q2-vault/internal/store"
 )
 
 // clock is a fake clock the test moves by hand.
@@ -467,5 +470,141 @@ func TestKeyRandFallsBack(t *testing.T) {
 	os.WriteFile(src, bytes.Repeat([]byte{7}, 64), 0o600)
 	if _, err := io.ReadFull(keyRand(src), b); err != nil || !bytes.Equal(b, bytes.Repeat([]byte{7}, 32)) {
 		t.Fatalf("hwrng not used: %v %x", err, b)
+	}
+}
+
+// eraseFixture is a store with one login and its key file, for eraseAll.
+func eraseFixture(t *testing.T) (*store.Store, config, [32]byte) {
+	t.Helper()
+	cfg, clk := fixture(t)
+	key, err := store.LoadOrCreateKey(cfg.Keys, crand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := &store.Store{Card: cfg.Card, Dir: cfg.Sealed, Mounts: cfg.Mounts, Master: key, Rand: crand.Reader, Now: clk.Now}
+	if err := st.Put("plex", []byte("s1")); err != nil {
+		t.Fatal(err)
+	}
+	return st, cfg, key
+}
+
+func keyFile(t *testing.T, cfg config) []byte {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(cfg.Keys, "key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func TestEraseAllKeyWriteFailsChangesNothing(t *testing.T) {
+	st, cfg, key := eraseFixture(t)
+	if err := os.Chmod(cfg.Keys, 0o500); err != nil { // the new key can't be written
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(cfg.Keys, 0o700) })
+	if err := eraseAll(st, cfg.Keys, crand.Reader); err == nil {
+		t.Fatal("no error when the key couldn't be written")
+	}
+	if !bytes.Equal(keyFile(t, cfg), key[:]) || st.Master != key {
+		t.Fatal("key changed")
+	}
+	if got, err := st.Get("plex"); err != nil || string(got) != "s1" {
+		t.Fatalf("login gone: %q %v", got, err)
+	}
+}
+
+func TestEraseAllCardAwayKeepsTheOldKey(t *testing.T) {
+	st, cfg, key := eraseFixture(t)
+	orig := storeErase
+	storeErase = func(st *store.Store, k [32]byte) error { // the card goes between the key and the erase
+		os.WriteFile(cfg.Mounts, []byte("/dev/root / ext4 rw 0 0\n"), 0o644)
+		return orig(st, k)
+	}
+	t.Cleanup(func() { storeErase = orig })
+	if err := eraseAll(st, cfg.Keys, crand.Reader); !errors.Is(err, store.ErrCardAway) {
+		t.Fatalf("err %v, want card away", err)
+	}
+	if !bytes.Equal(keyFile(t, cfg), key[:]) || st.Master != key {
+		t.Fatal("old key not kept")
+	}
+}
+
+func TestEraseAllCardAwayFirstWritesNothing(t *testing.T) {
+	st, cfg, key := eraseFixture(t)
+	os.WriteFile(cfg.Mounts, []byte("/dev/root / ext4 rw 0 0\n"), 0o644)
+	if err := eraseAll(st, cfg.Keys, crand.Reader); !errors.Is(err, store.ErrCardAway) {
+		t.Fatalf("err %v, want card away", err)
+	}
+	if !bytes.Equal(keyFile(t, cfg), key[:]) {
+		t.Fatal("key file changed with the card away")
+	}
+}
+
+func TestWanted(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "q2-vault.want")
+	t0 := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+	if wanted(p, t0) {
+		t.Fatal("wanted with no file")
+	}
+	os.WriteFile(p, nil, 0o644)
+	os.Chtimes(p, t0.Add(time.Second), t0.Add(time.Second))
+	if !wanted(p, t0) {
+		t.Fatal("a touch after the last tick not seen")
+	}
+	if wanted(p, t0.Add(time.Second)) || wanted(p, t0.Add(5*time.Second)) {
+		t.Fatal("an old touch seen again")
+	}
+}
+
+func TestRunStaysWhenTheLauncherWantsIt(t *testing.T) {
+	cfg, clk := fixture(t)
+	cfg.Serve = asPlex
+	done := start(t, context.Background(), cfg)
+	want := filepath.Join(cfg.Tmp, "q2-vault.want")
+	clk.Add(50 * time.Second)
+	time.Sleep(50 * time.Millisecond)
+	os.WriteFile(want, nil, 0o644) // an app's start ran the launcher again
+	os.Chtimes(want, clk.Now().Add(time.Second), clk.Now().Add(time.Second))
+	clk.Add(time.Second)
+	time.Sleep(50 * time.Millisecond)
+	clk.Add(10 * time.Second) // 61 s: the page's minute is over, the touch 10 s old
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case err := <-done:
+		t.Fatalf("closed though just wanted: %v", err)
+	default:
+	}
+	clk.Add(30 * time.Second)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("still running 30 s after the touch")
+	}
+}
+
+func TestRunFailsWithoutItsPage(t *testing.T) {
+	cfg, _ := fixture(t)
+	cfg.Serve = asPlex
+	cfg.Browse = filepath.Join(filepath.Dir(cfg.Browse), "no-such-dir", "b.sock")
+	orig := wipe
+	wiped := false
+	wipe = func(k *[32]byte) { orig(k); wiped = true }
+	t.Cleanup(func() { wipe = orig })
+	errc := make(chan error, 1)
+	go func() { errc <- run(context.Background(), cfg) }()
+	select {
+	case err := <-errc:
+		if err == nil {
+			t.Fatal("ran without its page")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("still running without its page")
+	}
+	if !wiped || exists(cfg.Socket) {
+		t.Fatalf("not closed cleanly: wiped %v, socket left %v", wiped, exists(cfg.Socket))
 	}
 }

@@ -71,11 +71,14 @@ def test_start_returns_at_once_and_second_start_is_noop(card):
     assert start(d, tmp) < 1
     assert wait(lambda: runs(d) == 1)
     first = pid(tmp)
+    assert not (tmp / 'q2-vault.want').exists()
     start(d, tmp)
     time.sleep(0.5)
     assert pid(tmp) == first and runs(d) == 1
+    assert (tmp / 'q2-vault.want').exists()  # the running Vault is told it's wanted
     os.kill(first, 15)
     assert wait(lambda: not (tmp / 'q2-vault').exists())
+    assert not (tmp / 'q2-vault.want').exists()
 
 
 def test_term_stops_within_3s_and_removes_pid(card):
@@ -135,3 +138,12 @@ def test_log_is_capped(card):
     assert wait(lambda: not (tmp / 'q2-vault').exists())
     log = (d / 'log.txt').read_text()
     assert len(log) <= (256 << 10) and log.endswith('boom\nexit 1\n')
+
+
+def test_backoff_doubles_to_a_minute():
+    """The loop's delays, from its own lines: 5, 10, 20, 40, then 60 s, never more."""
+    lines = [l.strip() for l in LAUNCHER.read_text().splitlines()]
+    i = lines.index('delay=$((delay * 2))')
+    script = 'delay=5\nfor n in 1 2 3 4 5 6; do echo $delay\n' + '\n'.join(lines[i:i + 2]) + '\ndone\n'
+    out = subprocess.run(['/bin/sh', '-c', script], capture_output=True, text=True, check=True).stdout
+    assert out.split() == ['5', '10', '20', '40', '60', '60']
