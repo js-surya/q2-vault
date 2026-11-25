@@ -192,7 +192,8 @@ ignores it; the Vault still works through `wifi=1` and its row.
   forked child, then runs the other app's binary in its own process, so the Vault sees that app. There is no cheap
   complete fix while all card apps share uid 1000 (the same uid can also read an app's memory unless the app sets
   `prctl(PR_SET_DUMPABLE, 0)`). The Vault protects logins from the card being read elsewhere, not from a hostile app
-  on the Q2.
+  on the Q2. Identity is "the running binary is the app's binary": an app that starts another app's real binary
+  under its own control (a debugger, or `LD_PRELOAD` for a dynamically linked binary) gets past it too.
 - While the Vault isn't running, another app could listen on its socket path; the client library therefore checks
   that the socket's owner is root (uid 0) before sending a login.
 - Swapping cards: the other card's logins stay on that card; on this one, apps sign in again.
