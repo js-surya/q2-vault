@@ -32,10 +32,13 @@ def fake_app(d, body):
     app.chmod(0o755)
 
 
+SH = os.environ.get('LAUNCHER_SH', '/bin/sh').split()  # another shell to try it under, e.g. the Q2's ash
+
+
 def start(d, tmp):
     env = dict(os.environ, Q2VAULT_TMP=str(tmp))
     t0 = time.time()
-    subprocess.run(['/bin/sh', str(d / 'run')], env=env, check=True, timeout=5)
+    subprocess.run(SH + [str(d / 'run')], env=env, check=True, timeout=5)
     return time.time() - t0
 
 
@@ -147,3 +150,82 @@ def test_backoff_doubles_to_a_minute():
     script = 'delay=5\nfor n in 1 2 3 4 5 6; do echo $delay\n' + '\n'.join(lines[i:i + 2]) + '\ndone\n'
     out = subprocess.run(['/bin/sh', '-c', script], capture_output=True, text=True, check=True).stdout
     assert out.split() == ['5', '10', '20', '40', '60', '60']
+
+
+# The launcher runs as root and writes in /tmp, where any app (uid 1000) can plant a link at each of its
+# paths: none may be followed, so a planted link never turns into a root write (or read) elsewhere.
+
+def planted(tmp_path, tmp, name, text='keep\n', tag=''):
+    """A link at tmp/name to a file of its own (target-<name><tag>); returns the file."""
+    target = tmp_path / ('target-' + name + tag)
+    target.write_text(text)
+    os.utime(target, (1_000_000_000, 1_000_000_000))
+    (tmp / name).symlink_to(target)
+    return target
+
+
+def untouched(target, text='keep\n'):
+    st = target.stat()
+    return target.read_text() == text and st.st_mtime == 1_000_000_000
+
+
+def test_planted_pid_link_not_followed(card, tmp_path):
+    d, tmp = card
+    target = planted(tmp_path, tmp, 'q2-vault')
+    fake_app(d, 'trap "exit 0" TERM\nwhile :; do sleep 1; done\n')
+    start(d, tmp)
+    assert wait(lambda: runs(d) == 1)
+    assert untouched(target)
+    assert not (tmp / 'q2-vault').is_symlink() and alive(pid(tmp))
+    os.kill(pid(tmp), 15)
+    assert wait(lambda: not (tmp / 'q2-vault').exists())
+    assert untouched(target)
+
+
+def test_planted_err_link_not_followed(card, tmp_path):
+    d, tmp = card
+    target = planted(tmp_path, tmp, 'q2-vault.err')
+    fake_app(d, 'echo boom >&2\nexit 3\n')
+    start(d, tmp)
+    crash = tmp / 'q2-vault.crash'
+    assert wait(lambda: crash.exists() and crash.read_text() == 'boom\nexit 3\n')
+    assert untouched(target)
+    assert not (tmp / 'q2-vault.err').is_symlink()
+    os.kill(pid(tmp), 15)
+    assert wait(lambda: not (tmp / 'q2-vault').exists())
+    assert untouched(target)
+
+
+def test_planted_crash_link_is_neither_read_nor_written(card, tmp_path):
+    d, tmp = card
+    # At start: a link at the crash path to a secret is not copied to the card's log, and goes.
+    secret = planted(tmp_path, tmp, 'q2-vault.crash', 'secret\n')
+    fake_app(d, 'sleep 0.5\necho boom >&2\nexit 3\n')
+    start(d, tmp)
+    assert wait(lambda: runs(d) == 1)
+    assert not (d / 'log.txt').exists() or 'secret' not in (d / 'log.txt').read_text()
+    assert not (tmp / 'q2-vault.crash').is_symlink()
+    # A link planted while the app runs is not written through when it fails.
+    target = planted(tmp_path, tmp, 'q2-vault.crash', tag='-2') if not (tmp / 'q2-vault.crash').exists() else None
+    crash = tmp / 'q2-vault.crash'
+    assert wait(lambda: not crash.is_symlink() and crash.exists() and crash.read_text() == 'boom\nexit 3\n')
+    assert untouched(secret, 'secret\n')
+    if target is not None:
+        assert untouched(target)
+    os.kill(pid(tmp), 15)
+    assert wait(lambda: not (tmp / 'q2-vault').exists())
+
+
+def test_planted_want_link_not_followed(card, tmp_path):
+    d, tmp = card
+    fake_app(d, 'trap "exit 0" TERM\nwhile :; do sleep 1; done\n')
+    start(d, tmp)
+    assert wait(lambda: runs(d) == 1)
+    target = planted(tmp_path, tmp, 'q2-vault.want')
+    start(d, tmp)  # already running: says it's wanted
+    assert untouched(target)
+    want = tmp / 'q2-vault.want'
+    assert want.exists() and not want.is_symlink()
+    os.kill(pid(tmp), 15)
+    assert wait(lambda: not (tmp / 'q2-vault').exists())
+    assert untouched(target)
