@@ -69,6 +69,24 @@ func (s *Store) mounted() error {
 
 func (s *Store) path(id string) string { return filepath.Join(s.Dir, id+".sealed") }
 
+// readSealed reads a sealed file, never more than seal.MaxBlob+1 bytes: a larger file can't be one
+// the Vault wrote, and is seal.ErrBad (set aside as .bad, as any file that won't open).
+func readSealed(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, seal.MaxBlob+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(b) > seal.MaxBlob {
+		return b, seal.ErrBad
+	}
+	return b, nil
+}
+
 // Get opens an app's secret. A file that does not open is set aside as .bad
 // and reported as ErrNone.
 func (s *Store) Get(id string) ([]byte, error) {
@@ -83,15 +101,16 @@ func (s *Store) Get(id string) ([]byte, error) {
 	if err := s.mounted(); err != nil {
 		return nil, err
 	}
-	blob, err := os.ReadFile(s.path(id))
+	blob, err := readSealed(s.path(id))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, ErrNone
 	}
-	if err != nil {
-		return nil, err
+	var secret []byte
+	if err == nil {
+		key := seal.AppKey(s.Master, id)
+		secret, err = seal.Open(key, id, blob)
+		clear(key[:])
 	}
-	key := seal.AppKey(s.Master, id)
-	secret, err := seal.Open(key, id, blob)
 	if err != nil {
 		if errors.Is(err, seal.ErrBad) {
 			if rerr := os.Rename(s.path(id), s.path(id)+".bad"); rerr != nil {
@@ -119,6 +138,7 @@ func (s *Store) Put(id string, secret []byte) error {
 	}
 	key := seal.AppKey(s.Master, id)
 	blob, err := seal.Seal(key, id, secret, s.Rand)
+	clear(key[:])
 	if err != nil {
 		return err
 	}
@@ -129,7 +149,7 @@ func (s *Store) Put(id string, secret []byte) error {
 	// Best-effort: the card is exFAT, whose driver refuses a mode it can't
 	// store (EPERM), and there the sealed files are what protect logins.
 	_ = chmodDir(s.Dir, 0o700)
-	return writeAtomic(s.path(id), blob, 0o600)
+	return writeAtomic(s.path(id), blob, 0o600, syncCardDir)
 }
 
 // Delete removes an app's sealed file; nothing there is fine.
@@ -152,7 +172,7 @@ func (s *Store) Delete(id string) error {
 	if err != nil {
 		return err
 	}
-	return syncDir(s.Dir)
+	return syncCardDir(s.Dir)
 }
 
 // List returns the saved logins, by id order.

@@ -331,3 +331,94 @@ func TestPutWhenFolderModeRefused(t *testing.T) {
 		t.Fatalf("%q %v", got, err)
 	}
 }
+
+// syncFails makes every folder fsync fail with errno, for the test's length.
+func syncFails(t *testing.T, errno syscall.Errno) *[]string {
+	t.Helper()
+	old := dirSync
+	t.Cleanup(func() { dirSync = old })
+	var dirs []string
+	dirSync = func(dir string) error {
+		dirs = append(dirs, dir)
+		return &os.PathError{Op: "sync", Path: dir, Err: errno}
+	}
+	return &dirs
+}
+
+func TestCardFolderSyncNotSupportedIsFine(t *testing.T) {
+	// exFAT's driver may refuse to fsync a folder: EINVAL or ENOTSUP.
+	for _, errno := range []syscall.Errno{syscall.EINVAL, syscall.ENOTSUP} {
+		t.Run(errno.Error(), func(t *testing.T) {
+			s := newStore(t, true)
+			dirs := syncFails(t, errno)
+			if err := s.Put("plex", []byte("tok")); err != nil {
+				t.Fatalf("put: %v", err)
+			}
+			if got, err := s.Get("plex"); err != nil || string(got) != "tok" {
+				t.Fatalf("get: %q %v", got, err)
+			}
+			if err := s.Delete("plex"); err != nil {
+				t.Fatalf("delete: %v", err)
+			}
+			if len(*dirs) != 2 || (*dirs)[0] != s.Dir || (*dirs)[1] != s.Dir {
+				t.Fatalf("folder syncs: %v", *dirs)
+			}
+		})
+	}
+}
+
+func TestCardFolderSyncOtherErrorsFail(t *testing.T) {
+	s := newStore(t, true)
+	if err := s.Put("plex", []byte("tok")); err != nil {
+		t.Fatal(err)
+	}
+	syncFails(t, syscall.EIO)
+	if err := s.Put("plex", []byte("tok2")); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("put: %v, want EIO", err)
+	}
+	if err := s.Delete("plex"); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("delete: %v, want EIO", err)
+	}
+}
+
+func TestKeyFolderSyncStaysStrict(t *testing.T) {
+	syncFails(t, syscall.EINVAL)
+	if _, err := LoadOrCreateKey(filepath.Join(t.TempDir(), "vault"), rand.Reader); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("key written though its folder's sync failed: %v", err)
+	}
+}
+
+func TestOversizeSealedFileIsSetAside(t *testing.T) {
+	s := newStore(t, true)
+	if err := s.Put("plex", []byte("tok")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(s.path("plex"), make([]byte, 4<<20), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Get("plex"); !errors.Is(err, ErrNone) {
+		t.Fatalf("want ErrNone, got %v", err)
+	}
+	if _, err := os.Stat(s.path("plex") + ".bad"); err != nil {
+		t.Fatalf("not set aside: %v", err)
+	}
+}
+
+func TestReadSealedIsBounded(t *testing.T) {
+	dir := t.TempDir()
+	at := func(n int) string {
+		p := filepath.Join(dir, fmt.Sprint(n))
+		if err := os.WriteFile(p, make([]byte, n), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	if b, err := readSealed(at(seal.MaxBlob)); err != nil || len(b) != seal.MaxBlob {
+		t.Fatalf("MaxBlob: %d bytes, %v", len(b), err)
+	}
+	for _, n := range []int{seal.MaxBlob + 1, 4 << 20} {
+		if b, err := readSealed(at(n)); !errors.Is(err, seal.ErrBad) || len(b) > seal.MaxBlob+1 {
+			t.Fatalf("%d bytes: read %d, %v; want seal.ErrBad", n, len(b), err)
+		}
+	}
+}
