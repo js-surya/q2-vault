@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -41,37 +42,87 @@ var (
 	peerPID = peerPIDOS
 )
 
-// Serve listens on the Unix socket until ctx ends. The socket is 0666 (apps
-// run as uid 1000, the Vault as root); the caller check, not the file mode,
-// is the boundary. One request per connection, a 5 s deadline, and onUse(id)
-// for each request answered for an app.
-func Serve(ctx context.Context, socket string, b Backend, procRoot string, onUse func(id string)) error {
+// Listener is the Vault's socket, bound and listening.
+type Listener struct {
+	*net.UnixListener
+	path string
+	mine os.FileInfo
+}
+
+// Close stops listening and removes the socket file, if it is still the one
+// Listen made (unlink by path could hit someone else's file).
+func (l *Listener) Close() error {
+	err := l.UnixListener.Close()
+	if now, serr := os.Lstat(l.path); serr == nil && l.mine != nil && os.SameFile(l.mine, now) {
+		os.Remove(l.path)
+	}
+	return err
+}
+
+// Listen binds the Unix socket, 0666 (apps run as uid 1000, the Vault as
+// root); the caller check, not the file mode, is the boundary. The umask is
+// narrowed only for the bind: call it before anything else creates files.
+func Listen(socket string) (*Listener, error) {
 	// A live socket owned by root is another Vault: not ours to remove. One
 	// owned by anyone else was bound by an app while the Vault was down
 	// (squatting): it goes, and we take the path.
 	if c, err := net.DialTimeout("unix", socket, time.Second); err == nil {
 		c.Close()
 		if fi, err := os.Lstat(socket); err == nil && fi.Mode()&os.ModeSocket != 0 && ownerIsRoot(fi) {
-			return errors.New("proto: another Vault is already listening")
+			return nil, errors.New("proto: another Vault is already listening")
 		}
 	}
-	os.Remove(socket) // a dead socket from a crash
+	if err := ClearPath(socket); err != nil {
+		return nil, err
+	}
 	// Created 0666 directly: no window, and no chmod by path.
 	old := syscall.Umask(0o111)
 	ln, err := net.Listen("unix", socket)
 	syscall.Umask(old)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	ul := ln.(*net.UnixListener)
-	ul.SetUnlinkOnClose(false) // unlink by path could hit someone else's file
+	ul.SetUnlinkOnClose(false) // Close unlinks, and only our own file
 	mine, _ := os.Lstat(socket)
-	defer func() {
-		if now, err := os.Lstat(socket); err == nil && mine != nil && os.SameFile(mine, now) {
-			os.Remove(socket)
-		}
-	}()
-	go func() { <-ctx.Done(); ln.Close() }()
+	return &Listener{UnixListener: ul, path: socket, mine: mine}, nil
+}
+
+// ClearPath makes way for a socket at path: a stale file goes, and a folder
+// (which os.Remove can't take when it isn't empty) is renamed aside as
+// <path>.bad.<pid>, so a folder planted there can't keep the Vault down.
+func ClearPath(path string) error {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return nil // nothing there (or nothing we can see): Listen says
+	}
+	if fi.IsDir() {
+		return os.Rename(path, path+".bad."+strconv.Itoa(os.Getpid()))
+	}
+	os.Remove(path) // a dead socket from a crash
+	return nil
+}
+
+// Serve listens on the Unix socket (Listen) and serves it (ServeOn).
+func Serve(ctx context.Context, socket string, b Backend, procRoot string, onUse func(id string)) error {
+	l, err := Listen(socket)
+	if err != nil {
+		return err
+	}
+	return ServeOn(ctx, l, b, procRoot, onUse)
+}
+
+// ServeOn answers on l until ctx ends, then closes l. One request per
+// connection, a 5 s deadline, and onUse(id) for each request answered for an
+// app. When ctx ends, every open connection's deadline is moved to now, so
+// Serve returns at once (the launcher KILLs 2 s after its TERM); a store
+// write in progress still finishes, only its answer is lost.
+func ServeOn(ctx context.Context, l *Listener, b Backend, procRoot string, onUse func(id string)) error {
+	defer l.Close()
+	go func() { <-ctx.Done(); l.UnixListener.Close() }()
+	open := &conns{m: map[*net.UnixConn]struct{}{}}
+	stop := context.AfterFunc(ctx, open.cut)
+	defer stop()
 
 	var wg sync.WaitGroup
 	defer wg.Wait()
@@ -79,7 +130,7 @@ func Serve(ctx context.Context, socket string, b Backend, procRoot string, onUse
 	pc := &perCaller{n: map[string]int{}}
 	backoff := time.Duration(0)
 	for {
-		c, err := ln.Accept()
+		c, err := l.Accept()
 		if err != nil {
 			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				return nil
@@ -104,18 +155,56 @@ func Serve(ctx context.Context, socket string, b Backend, procRoot string, onUse
 			c.Close() // too many at once
 			continue
 		}
+		uc := c.(*net.UnixConn)
+		// The 5 s deadline is set here, before add: a cut at shutdown always
+		// comes after it, never overwritten by it.
+		uc.SetDeadline(time.Now().Add(deadline))
+		open.add(uc)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			handle(c.(*net.UnixConn), b, procRoot, onUse, pc)
+			defer open.remove(uc)
+			handle(uc, b, procRoot, onUse, pc)
 		}()
+	}
+}
+
+// conns is the set of open connections, cut at shutdown.
+type conns struct {
+	mu      sync.Mutex
+	stopped bool
+	m       map[*net.UnixConn]struct{}
+}
+
+func (o *conns) add(c *net.UnixConn) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.m[c] = struct{}{}
+	if o.stopped {
+		c.SetDeadline(time.Now())
+	}
+}
+
+func (o *conns) remove(c *net.UnixConn) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	delete(o.m, c)
+}
+
+// cut moves every open connection's deadline to now, and each later one's
+// as it is added.
+func (o *conns) cut() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.stopped = true
+	for c := range o.m {
+		c.SetDeadline(time.Now())
 	}
 }
 
 func handle(c *net.UnixConn, b Backend, procRoot string, onUse func(string), pc *perCaller) {
 	defer c.Close()
-	c.SetDeadline(time.Now().Add(deadline))
 
 	pid, err := peerPID(c)
 	var id string

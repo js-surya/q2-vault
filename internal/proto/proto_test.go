@@ -276,15 +276,27 @@ func start(t *testing.T, f *fake, caller string, used *[]string, mu *sync.Mutex)
 		})
 	}()
 	t.Cleanup(func() { cancel(); <-done })
+	// Ready once the stale file is a socket: no probe connection, so onUse
+	// counts only the test's own requests.
 	for i := 0; i < 200; i++ {
-		if c, err := net.Dial("unix", sock); err == nil {
-			c.Close()
+		if fi, err := os.Lstat(sock); err == nil && fi.Mode()&os.ModeSocket != 0 {
 			return sock
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("server did not start")
 	return ""
+}
+
+// poll waits up to 2 s for cond.
+func poll(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	for end := time.Now().Add(2 * time.Second); time.Now().Before(end); time.Sleep(5 * time.Millisecond) {
+		if cond() {
+			return
+		}
+	}
+	t.Fatalf("timed out waiting for %s", what)
 }
 
 func ask(t *testing.T, sock string, req []byte) []byte {
@@ -451,6 +463,7 @@ func TestServePerCallerCap(t *testing.T) {
 	var used []string
 	var mu sync.Mutex
 	sock := start(t, f, "plex", &used, &mu)
+	uses := func() int { mu.Lock(); defer mu.Unlock(); return len(used) }
 	var held []net.Conn
 	for i := 0; i < maxPerApp; i++ {
 		c, err := net.Dial("unix", sock)
@@ -460,17 +473,87 @@ func TestServePerCallerCap(t *testing.T) {
 		held = append(held, c)
 		defer c.Close()
 	}
-	time.Sleep(200 * time.Millisecond) // let the server take them
+	// Every held connection is past enter (onUse fires right after it).
+	poll(t, "the held connections to be taken", func() bool { return uses() == maxPerApp })
 	start := time.Now()
 	if got := ask(t, sock, []byte("Q2VAULT/1\nget\n")); len(got) != 0 || time.Since(start) > 2*time.Second {
 		t.Errorf("over the cap: %q after %v", got, time.Since(start))
 	}
+	if n := uses(); n != maxPerApp {
+		t.Errorf("onUse for a connection over the cap: %d calls", n)
+	}
 	for _, c := range held {
 		c.Close()
 	}
-	time.Sleep(200 * time.Millisecond)
+	// Released as each held handler ends: answered again within 2 s.
+	poll(t, "an answer after release", func() bool {
+		return string(ask(t, sock, []byte("Q2VAULT/1\nget\n"))) == "Q2VAULT/1\nnone\n"
+	})
+}
+
+func TestServeShutdownCutsOpenConnections(t *testing.T) {
+	oldA, oldP := appID, peerPID
+	appID = func(string, int) (string, error) { return "plex", nil }
+	peerPID = func(*net.UnixConn) (int, error) { return 1, nil }
+	t.Cleanup(func() { appID, peerPID = oldA, oldP })
+	dir, _ := os.MkdirTemp("", "q2v")
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "v.sock")
+	var uses atomic.Int32
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- Serve(ctx, sock, &fake{data: map[string][]byte{}}, "/proc", func(string) { uses.Add(1) })
+	}()
+	poll(t, "the socket", func() bool { fi, err := os.Lstat(sock); return err == nil && fi.Mode()&os.ModeSocket != 0 })
+	// Two slow clients: each holds its connection, sending nothing.
+	for range 2 {
+		c, err := net.Dial("unix", sock)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+	}
+	poll(t, "the slow clients to be taken", func() bool { return uses.Load() == 2 })
+	t0 := time.Now()
+	cancel() // TERM: Serve must not wait out their 5 s deadline (the launcher KILLs after 2 s)
+	select {
+	case <-done:
+		if el := time.Since(t0); el > time.Second {
+			t.Fatalf("Serve took %v to return", el)
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("Serve still waiting on open connections")
+	}
+}
+
+func TestServeSetsAsideADirectoryAtItsPath(t *testing.T) {
+	oldA, oldP := appID, peerPID
+	appID = func(string, int) (string, error) { return "plex", nil }
+	peerPID = func(*net.UnixConn) (int, error) { return 1, nil }
+	t.Cleanup(func() { appID, peerPID = oldA, oldP })
+	dir, _ := os.MkdirTemp("", "q2v")
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "v.sock")
+	// A folder planted at the path, not empty: os.Remove can't take it.
+	if err := os.MkdirAll(filepath.Join(sock, "inside"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- Serve(ctx, sock, &fake{data: map[string][]byte{}}, "/proc", nil) }()
+	t.Cleanup(func() { cancel(); <-done })
+	poll(t, "the socket in place of the folder", func() bool {
+		fi, err := os.Lstat(sock)
+		return err == nil && fi.Mode()&os.ModeSocket != 0
+	})
+	aside := sock + ".bad." + strconv.Itoa(os.Getpid())
+	if fi, err := os.Stat(filepath.Join(aside, "inside")); err != nil || !fi.IsDir() {
+		t.Fatalf("folder not set aside as %s: %v", aside, err)
+	}
 	if got := ask(t, sock, []byte("Q2VAULT/1\nget\n")); string(got) != "Q2VAULT/1\nnone\n" {
-		t.Errorf("after release: %q", got)
+		t.Fatalf("get: %q", got)
 	}
 }
 
