@@ -78,6 +78,7 @@ func TestPutGetDelete(t *testing.T) {
 
 func TestPutErrorsFromSeal(t *testing.T) {
 	s := newStore(t, true)
+	os.Mkdir(s.Dir, 0o700)
 	if err := s.Put("a", nil); !errors.Is(err, seal.ErrEmpty) {
 		t.Fatalf("got %v", err)
 	}
@@ -144,11 +145,38 @@ func TestUnreadableSetAside(t *testing.T) {
 
 func TestConcurrentPuts(t *testing.T) {
 	s := newStore(t, true)
-	var wg sync.WaitGroup
 	vals := map[string]bool{}
+	var list []string
 	for i := 0; i < 20; i++ {
 		v := fmt.Sprintf("value-%02d-%s", i, bytes.Repeat([]byte("z"), 500))
 		vals[v] = true
+		list = append(list, v)
+	}
+	stop := make(chan struct{})
+	var rg sync.WaitGroup
+	for r := 0; r < 4; r++ {
+		rg.Add(1)
+		go func() {
+			defer rg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				got, err := s.Get("plex")
+				if errors.Is(err, ErrNone) {
+					continue
+				}
+				if err != nil || !vals[string(got)] {
+					t.Errorf("Get: %v (known value=%v)", err, vals[string(got)])
+					return
+				}
+			}
+		}()
+	}
+	var wg sync.WaitGroup
+	for _, v := range list {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -158,6 +186,8 @@ func TestConcurrentPuts(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+	close(stop)
+	rg.Wait()
 	got, err := s.Get("plex")
 	if err != nil || !vals[string(got)] {
 		t.Fatalf("final value not one written: %v", err)
@@ -209,6 +239,64 @@ func TestEraseAll(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got, err := s.Get("a"); err != nil || string(got) != "3" {
+		t.Fatalf("%q %v", got, err)
+	}
+}
+
+func TestEraseAllTriesEverything(t *testing.T) {
+	s := newStore(t, true)
+	s.Put("a", []byte("1"))
+	s.Put("c", []byte("3"))
+	stuck := filepath.Join(s.Dir, "b.sealed")
+	os.MkdirAll(filepath.Join(stuck, "inner"), 0o700)
+	k2 := [32]byte{7}
+	if err := s.EraseAll(k2); err == nil {
+		t.Fatal("want an error for the stuck entry")
+	}
+	for _, id := range []string{"a", "c"} {
+		if _, err := os.Stat(filepath.Join(s.Dir, id+".sealed")); !os.IsNotExist(err) {
+			t.Fatalf("%s survived", id)
+		}
+	}
+	if s.Master != k2 {
+		t.Fatal("new master not adopted")
+	}
+}
+
+func TestKeyPermissionsFixedAndZeroRefused(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "vault")
+	k1, _ := LoadOrCreateKey(dir, rand.Reader)
+	os.Chmod(dir, 0o755)
+	os.Chmod(filepath.Join(dir, "key"), 0o644)
+	k2, err := LoadOrCreateKey(dir, rand.Reader)
+	if err != nil || k1 != k2 {
+		t.Fatal(err)
+	}
+	di, _ := os.Stat(dir)
+	fi, _ := os.Stat(filepath.Join(dir, "key"))
+	if di.Mode().Perm() != 0o700 || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("modes %v %v", di.Mode().Perm(), fi.Mode().Perm())
+	}
+	os.WriteFile(filepath.Join(dir, "key"), make([]byte, 32), 0o600)
+	if _, err := LoadOrCreateKey(dir, rand.Reader); err == nil {
+		t.Fatal("all-zero key accepted")
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "key")); !bytes.Equal(b, make([]byte, 32)) {
+		t.Fatal("zero key was overwritten")
+	}
+}
+
+func TestCutOffWriteKeepsOldFile(t *testing.T) {
+	s := newStore(t, true)
+	if err := s.Put("plex", []byte("old")); err != nil {
+		t.Fatal(err)
+	}
+	os.Mkdir(filepath.Join(s.Dir, "plex.sealed.tmp"), 0o700)
+	if err := s.Put("plex", []byte("new")); err == nil {
+		t.Fatal("Put should fail")
+	}
+	got, err := s.Get("plex")
+	if err != nil || string(got) != "old" {
 		t.Fatalf("%q %v", got, err)
 	}
 }

@@ -59,6 +59,12 @@ func LoadOrCreateKey(dir string, rand io.Reader) ([32]byte, error) {
 			return k, fmt.Errorf("store: key file is %d bytes, want 32", len(b))
 		}
 		copy(k[:], b)
+		if k == [32]byte{} {
+			return [32]byte{}, errors.New("store: key file is all zero")
+		}
+		if err := os.Chmod(path, 0o600); err != nil {
+			return [32]byte{}, err
+		}
 		return k, nil
 	case !errors.Is(err, os.ErrNotExist):
 		return k, err

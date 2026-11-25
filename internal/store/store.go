@@ -91,7 +91,9 @@ func (s *Store) Get(id string) ([]byte, error) {
 	secret, err := seal.Open(key, id, blob)
 	if err != nil {
 		if errors.Is(err, seal.ErrBad) {
-			os.Rename(s.path(id), s.path(id)+".bad")
+			if rerr := os.Rename(s.path(id), s.path(id)+".bad"); rerr != nil {
+				return nil, rerr
+			}
 			return nil, ErrNone
 		}
 		return nil, err
@@ -117,7 +119,7 @@ func (s *Store) Put(id string, secret []byte) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(s.Dir, 0o700); err != nil {
+	if err := os.Mkdir(s.Dir, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
 		return err
 	}
 	return writeAtomic(s.path(id), blob, 0o600)
@@ -137,10 +139,13 @@ func (s *Store) Delete(id string) error {
 		return err
 	}
 	err := os.Remove(s.path(id))
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
 		return err
 	}
-	return nil
+	return syncDir(s.Dir)
 }
 
 // List returns the saved logins, by id order.
@@ -183,16 +188,17 @@ func (s *Store) EraseAll(newMaster [32]byte) error {
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
+	var errs []error
 	for _, de := range des {
 		n := de.Name()
 		if strings.HasSuffix(n, ".sealed") || strings.HasSuffix(n, ".sealed.bad") || strings.HasSuffix(n, ".sealed.tmp") {
 			if err := os.Remove(filepath.Join(s.Dir, n)); err != nil {
-				return fmt.Errorf("store: erase: %w", err)
+				errs = append(errs, fmt.Errorf("store: erase %s: %w", n, err))
 			}
 		}
 	}
-	s.Master = newMaster
-	return nil
+	s.Master = newMaster // adopted even if some file stayed: old files can't open under it
+	return errors.Join(errs...)
 }
 
 // Clean removes leftover *.sealed.tmp files from cut-off writes.
