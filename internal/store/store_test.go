@@ -315,3 +315,19 @@ func TestPutFolderIs0700UnderNarrowUmask(t *testing.T) {
 		t.Fatalf("folder mode %v %v", fi.Mode().Perm(), err)
 	}
 }
+
+func TestPutWhenFolderModeRefused(t *testing.T) {
+	old := chmodDir
+	t.Cleanup(func() { chmodDir = old })
+	chmodDir = func(name string, _ os.FileMode) error {
+		return &os.PathError{Op: "chmod", Path: name, Err: syscall.EPERM}
+	}
+	s := newStore(t, true)
+	if err := s.Put("plex", []byte("tok")); err != nil {
+		t.Fatalf("put with exFAT-style chmod refusal: %v", err)
+	}
+	got, err := s.Get("plex")
+	if err != nil || string(got) != "tok" {
+		t.Fatalf("%q %v", got, err)
+	}
+}

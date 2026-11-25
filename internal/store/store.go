@@ -23,6 +23,9 @@ var (
 
 var idRe = regexp.MustCompile(`^[a-z0-9-]{1,15}$`)
 
+// chmodDir sets the card folder's mode; a hook so tests can make it fail.
+var chmodDir = os.Chmod
+
 // Entry is one saved login: the app id and when it was saved.
 type Entry struct {
 	ID    string
@@ -123,9 +126,9 @@ func (s *Store) Put(id string, secret []byte) error {
 		return err
 	}
 	// A narrow umask (the socket window) can leave the folder without x bits.
-	if err := os.Chmod(s.Dir, 0o700); err != nil {
-		return err
-	}
+	// Best-effort: the card is exFAT, whose driver refuses a mode it can't
+	// store (EPERM), and there the sealed files are what protect logins.
+	_ = chmodDir(s.Dir, 0o700)
 	return writeAtomic(s.path(id), blob, 0o600)
 }
 

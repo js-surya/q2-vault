@@ -507,8 +507,7 @@ func TestServeRemovesSquatterSocket(t *testing.T) {
 	}()
 	oldO := ownerIsRoot
 	t.Cleanup(func() { ownerIsRoot = oldO })
-	ownerIsRoot = func(os.FileInfo) bool { return false } // owned by someone else
-	// With a root-owned live socket it must refuse instead.
+	// With a root-owned live socket it must refuse.
 	ownerIsRoot = func(os.FileInfo) bool { return true }
 	if err := Serve(context.Background(), sock, &fake{}, "/proc", nil); err == nil {
 		t.Fatal("a live root-owned socket should stop Serve")
