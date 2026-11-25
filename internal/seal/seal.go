@@ -13,6 +13,9 @@ import (
 // MaxSecret is the largest secret that can be sealed.
 const MaxSecret = 16384
 
+// MaxBlob is the largest sealed blob Open accepts.
+const MaxBlob = 5 + 24 + MaxSecret + 16
+
 var (
 	ErrTooLarge = errors.New("seal: secret too large")
 	ErrEmpty    = errors.New("seal: secret empty")
@@ -64,9 +67,9 @@ func Seal(key [32]byte, id string, secret []byte, rand io.Reader) ([]byte, error
 func Open(key [32]byte, id string, blob []byte) ([]byte, error) {
 	aead, err := chacha20poly1305.NewX(key[:])
 	if err != nil {
-		return nil, err
+		return nil, ErrBad
 	}
-	if len(blob) < header+aead.NonceSize()+aead.Overhead() ||
+	if len(blob) < header+aead.NonceSize()+1+aead.Overhead() || len(blob) > MaxBlob ||
 		string(blob[:len(magic)]) != magic || blob[len(magic)] != version {
 		return nil, ErrBad
 	}

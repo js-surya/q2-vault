@@ -5,6 +5,9 @@ import (
 	crand "crypto/rand"
 	"errors"
 	"testing"
+
+	"golang.org/x/crypto/blake2b"
+	"golang.org/x/crypto/chacha20poly1305"
 )
 
 var master = [32]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
@@ -28,7 +31,14 @@ func TestRoundTrip(t *testing.T) {
 
 func TestFormat(t *testing.T) {
 	s := []byte("hello secret")
-	blob := mustSeal(t, "plex", s)
+	fixed := bytes.Repeat([]byte{7}, 24)
+	blob, err := Seal(AppKey(master, "plex"), "plex", s, bytes.NewReader(fixed))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(blob[5:29], fixed) {
+		t.Fatal("nonce not from rand")
+	}
 	if !bytes.HasPrefix(blob, []byte("Q2VT\x01")) {
 		t.Fatalf("bad header %q", blob[:5])
 	}
@@ -54,9 +64,46 @@ func TestWrongKey(t *testing.T) {
 
 func TestChangedByte(t *testing.T) {
 	blob := mustSeal(t, "plex", []byte("tok"))
-	blob[5+24] ^= 1
-	if _, err := Open(AppKey(master, "plex"), "plex", blob); !errors.Is(err, ErrBad) {
-		t.Fatalf("got %v", err)
+	for _, i := range []int{5 + 24, 5, len(blob) - 1} {
+		c := append([]byte(nil), blob...)
+		c[i] ^= 1
+		if _, err := Open(AppKey(master, "plex"), "plex", c); !errors.Is(err, ErrBad) {
+			t.Fatalf("byte %d: got %v", i, err)
+		}
+	}
+}
+
+func TestKnownAnswer(t *testing.T) {
+	h, _ := blake2b.New256(master[:])
+	h.Write([]byte("q2pod-vault/v1/plex"))
+	var want [32]byte
+	h.Sum(want[:0])
+	if AppKey(master, "plex") != want {
+		t.Fatal("derivation changed")
+	}
+}
+
+func TestShortRand(t *testing.T) {
+	b, err := Seal(AppKey(master, "plex"), "plex", []byte("x"), bytes.NewReader(make([]byte, 10)))
+	if err == nil || b != nil {
+		t.Fatalf("got %v, %v", b, err)
+	}
+}
+
+func TestOpenBounds(t *testing.T) {
+	k := AppKey(master, "plex")
+	if _, err := Open(k, "plex", make([]byte, MaxBlob+1)); !errors.Is(err, ErrBad) {
+		t.Fatalf("big: %v", err)
+	}
+	aead, _ := chacha20poly1305.NewX(k[:])
+	nonce := make([]byte, 24)
+	blob := append([]byte("Q2VT\x01"), nonce...)
+	blob = aead.Seal(blob, nonce, nil, []byte("q2pod-vault/v1/plex"))
+	if len(blob) != 45 {
+		t.Fatalf("len %d", len(blob))
+	}
+	if _, err := Open(k, "plex", blob); !errors.Is(err, ErrBad) {
+		t.Fatalf("empty: %v", err)
 	}
 }
 
