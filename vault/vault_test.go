@@ -255,10 +255,14 @@ func TestInstalledButNotRunningIsImmediate(t *testing.T) {
 func TestRetryStopsWhenTheLauncherEnds(t *testing.T) {
 	setup(t)
 	retryFor = 3 * time.Second
+	proc := filepath.Join(ProcRoot, "4242") // read here: setup's cleanup restores ProcRoot
+	ended := make(chan struct{})
 	go func() {
+		defer close(ended)
 		time.Sleep(100 * time.Millisecond)
-		os.RemoveAll(filepath.Join(ProcRoot, "4242"))
+		os.RemoveAll(proc)
 	}()
+	defer func() { <-ended }()
 	start := time.Now()
 	if _, err := Get(); !errors.Is(err, ErrNoVault) {
 		t.Fatal(err)

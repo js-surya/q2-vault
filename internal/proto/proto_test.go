@@ -613,3 +613,51 @@ func TestServeRemovesSquatterSocket(t *testing.T) {
 	}
 	t.Fatal("Serve did not take the squatted path")
 }
+
+func TestRefusedCallersCantHoldTheLine(t *testing.T) {
+	// 40 refused callers that send nothing and never close: a valid caller is
+	// still answered at once (each refused one held a slot for 1 s before).
+	var refuse atomic.Bool
+	var refusals atomic.Int32
+	oldA, oldP := appID, peerPID
+	appID = func(string, int) (string, error) {
+		if refuse.Load() {
+			refusals.Add(1)
+			return "", errors.New("not a card app")
+		}
+		return "plex", nil
+	}
+	peerPID = func(*net.UnixConn) (int, error) { return 1, nil }
+	t.Cleanup(func() { appID, peerPID = oldA, oldP })
+	dir, _ := os.MkdirTemp("", "q2v")
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "v.sock")
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- Serve(ctx, sock, &fake{data: map[string][]byte{}}, "/proc", nil) }()
+	t.Cleanup(func() { cancel(); <-done })
+	poll(t, "the socket", func() bool { fi, err := os.Lstat(sock); return err == nil && fi.Mode()&os.ModeSocket != 0 })
+	refuse.Store(true)
+	for range 40 {
+		c, err := net.Dial("unix", sock)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+	}
+	// Every one refused (none taken as plex once refuse is off, which would hold plex's own share);
+	// before this fix only 32 got as far, the rest closed for want of a slot.
+	poll(t, "all 40 refusals", func() bool { return refusals.Load() == 40 })
+	refuse.Store(false)
+	// Answered within 300 ms (a refused one being handled may hold its slot for an instant; before
+	// this fix each held one for a second).
+	start := time.Now()
+	var got []byte
+	for time.Since(start) < 300*time.Millisecond {
+		if got = ask(t, sock, []byte("Q2VAULT/1\nget\n")); string(got) == "Q2VAULT/1\nnone\n" {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("valid caller after 40 refused ones: %q for %v", got, time.Since(start))
+}

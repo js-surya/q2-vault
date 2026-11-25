@@ -62,19 +62,20 @@ func fixture(t *testing.T) (config, *clock) {
 		t.Fatal(err)
 	}
 	return config{
-		Caps:   caps,
-		Dir:    filepath.Join(card, ".vault"),
-		Card:   card,
-		Sealed: filepath.Join(card, ".q2vault"),
-		Keys:   filepath.Join(root, "data", "apps", "vault"),
-		Socket: filepath.Join(socks, "v.sock"),
-		Browse: filepath.Join(socks, "b.sock"),
-		Tmp:    tmp,
-		Mounts: mounts,
-		Proc:   filepath.Join(root, "proc"),
-		Now:    clk.Now,
-		Tick:   10 * time.Millisecond,
-		Logf:   t.Logf,
+		Caps:      caps,
+		capsOwner: func(os.FileInfo) bool { return true }, // the test can't make root's files
+		Dir:       filepath.Join(card, ".vault"),
+		Card:      card,
+		Sealed:    filepath.Join(card, ".q2vault"),
+		Keys:      filepath.Join(root, "data", "apps", "vault"),
+		Socket:    filepath.Join(socks, "v.sock"),
+		Browse:    filepath.Join(socks, "b.sock"),
+		Tmp:       tmp,
+		Mounts:    mounts,
+		Proc:      filepath.Join(root, "proc"),
+		Now:       clk.Now,
+		Tick:      10 * time.Millisecond,
+		Logf:      t.Logf,
 	}, clk
 }
 
@@ -686,9 +687,50 @@ func TestRunStaysForAnAppThatAskedThisRun(t *testing.T) {
 	}
 }
 
+func TestFirmwareHasTrustsOnlyRootsFile(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "caps")
+	os.WriteFile(p, []byte("art needs\n"), 0o644)
+	no := func(os.FileInfo) bool { return false }
+	yes := func(os.FileInfo) bool { return true }
+	if firmwareHas(p, "needs", no) { // an app's file: no needs
+		t.Fatal("trusted a caps file not owned by root")
+	}
+	if !firmwareHas(p, "needs", yes) {
+		t.Fatal("root's caps file not read")
+	}
+	if firmwareHas(p, "needs", ownedByRoot) { // the test's own file, for real
+		t.Fatal("trusted a file the test (not root) owns")
+	}
+	// A link (to root's file, even) or a folder is not trusted.
+	l := filepath.Join(dir, "link")
+	os.Symlink(p, l)
+	if firmwareHas(l, "needs", yes) {
+		t.Fatal("followed a link")
+	}
+	if firmwareHas(dir, "needs", yes) {
+		t.Fatal("read a folder")
+	}
+}
+
+func TestRunStaysWhenCapsAreNotRoots(t *testing.T) {
+	cfg, clk := fixture(t)
+	cfg.Serve = asPlex
+	cfg.capsOwner = func(os.FileInfo) bool { return false } // an app wrote it
+	done := start(t, context.Background(), cfg)
+	clk.Add(10 * time.Minute)
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case err := <-done:
+		t.Fatalf("closed on caps an app could have written: %v", err)
+	default:
+	}
+}
+
 func TestFirmwareHas(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "caps")
-	if firmwareHas(p, "needs") {
+	yes := func(os.FileInfo) bool { return true }
+	if firmwareHas(p, "needs", yes) {
 		t.Fatal("no file has needs")
 	}
 	for text, want := range map[string]bool{
@@ -696,7 +738,7 @@ func TestFirmwareHas(t *testing.T) {
 		"art now": false, "": false, "xneeds": false,
 	} {
 		os.WriteFile(p, []byte(text), 0o644)
-		if got := firmwareHas(p, "needs"); got != want {
+		if got := firmwareHas(p, "needs", yes); got != want {
 			t.Errorf("%q: %v, want %v", text, got, want)
 		}
 	}

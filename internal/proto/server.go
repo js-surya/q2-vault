@@ -28,8 +28,10 @@ const (
 	maxPerApp  = 4
 	deadline   = 5 * time.Second
 	drainMax   = 4 << 20
-	// refusedDrain bounds the read of a refused caller's request: a client has written it by then.
-	refusedDrain = time.Second
+	// A refused caller's request is read (refusedDrain at most) after its connection has given back
+	// its slot, maxDrains at a time; beyond that it is closed at once.
+	refusedDrain = 100 * time.Millisecond
+	maxDrains    = 4
 )
 
 // ownerIsRoot says whether a file belongs to uid 0; a variable for tests.
@@ -129,6 +131,7 @@ func ServeOn(ctx context.Context, l *Listener, b Backend, procRoot string, onUse
 	var wg sync.WaitGroup
 	defer wg.Wait()
 	sem := make(chan struct{}, maxConns)
+	drains := make(chan struct{}, maxDrains)
 	pc := &perCaller{n: map[string]int{}}
 	backoff := time.Duration(0)
 	for {
@@ -165,9 +168,12 @@ func ServeOn(ctx context.Context, l *Listener, b Backend, procRoot string, onUse
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			defer func() { <-sem }()
 			defer open.remove(uc)
-			handle(uc, b, procRoot, onUse, pc)
+			refused := handle(uc, b, procRoot, onUse, pc)
+			<-sem // a refused caller doesn't keep its slot while its request is read
+			if refused {
+				drainRefused(uc, drains)
+			}
 		}()
 	}
 }
@@ -205,8 +211,13 @@ func (o *conns) cut() {
 	}
 }
 
-func handle(c *net.UnixConn, b Backend, procRoot string, onUse func(string), pc *perCaller) {
-	defer c.Close()
+// handle answers one connection and closes it, except a refused one (true), left to drainRefused.
+func handle(c *net.UnixConn, b Backend, procRoot string, onUse func(string), pc *perCaller) (refused bool) {
+	defer func() {
+		if !refused {
+			c.Close()
+		}
+	}()
 
 	pid, err := peerPID(c)
 	var id string
@@ -215,11 +226,7 @@ func handle(c *net.UnixConn, b Backend, procRoot string, onUse func(string), pc 
 	}
 	if err != nil {
 		reply(c, StatusRefused, nil)
-		// Read what the caller sent (1 s at most) before closing: on Linux, closing with its
-		// request unread resets the connection, and the caller loses the answer.
-		c.SetReadDeadline(time.Now().Add(refusedDrain))
-		drain(c)
-		return
+		return true
 	}
 
 	if !pc.enter(id) {
@@ -275,6 +282,22 @@ func handle(c *net.UnixConn, b Backend, procRoot string, onUse func(string), pc 
 		return
 	}
 	reply(c, status, out)
+	return false
+}
+
+// drainRefused reads what a refused caller sent (refusedDrain at most) before closing: on Linux,
+// closing with its request unread resets the connection, and the caller loses the answer. Only
+// maxDrains at once, so callers the Vault can't identify (not counted per app) can't tie it up;
+// beyond that the connection is closed at once.
+func drainRefused(c *net.UnixConn, drains chan struct{}) {
+	defer c.Close()
+	select {
+	case drains <- struct{}{}:
+		defer func() { <-drains }()
+		c.SetReadDeadline(time.Now().Add(refusedDrain))
+		drain(c)
+	default:
+	}
 }
 
 // perCaller limits concurrent connections per app id.

@@ -51,7 +51,8 @@ type config struct {
 	Serve  func(ctx context.Context, l *proto.Listener, b proto.Backend, procRoot string, onUse func(string)) error
 	OnStop func() // at TERM or INT (not an idle close): the removal watch
 
-	running func(tmp, id string) bool // idle.Running; a hook for tests
+	running   func(tmp, id string) bool // idle.Running; a hook for tests
+	capsOwner func(os.FileInfo) bool    // ownedByRoot; a hook for tests (they can't make root's files)
 }
 
 // usersEvery is how often the list of apps that use the Vault is read again (card reads).
@@ -125,6 +126,9 @@ func run(ctx context.Context, cfg config) error {
 	}
 	if cfg.running == nil {
 		cfg.running = idle.Running
+	}
+	if cfg.capsOwner == nil {
+		cfg.capsOwner = ownedByRoot
 	}
 	logf := cfg.Logf
 
@@ -276,7 +280,7 @@ loop:
 			// Only firmware with needs= starts the Vault again for the next app that needs it;
 			// without it, closing would sign apps out until Wi-Fi or its row starts it, so it stays
 			// (wifi=1's stop and a TERM still end it). The caps are read at each idle decision.
-			if tracker.Idle() && firmwareHas(cfg.Caps, "needs") {
+			if tracker.Idle() && firmwareHas(cfg.Caps, "needs", cfg.capsOwner) {
 				logf("no app uses the Vault: closing")
 				break loop
 			}
@@ -415,9 +419,27 @@ func listenPage(path string) (net.Listener, error) {
 	return l, err
 }
 
-// firmwareHas reports whether the firmware's caps file (one line of words) lists word.
-func firmwareHas(caps, word string) bool {
-	b, err := os.ReadFile(caps)
+// ownedByRoot says whether a file belongs to uid 0.
+func ownedByRoot(fi os.FileInfo) bool {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	return ok && st.Uid == 0
+}
+
+// firmwareHas reports whether the firmware's caps file (one line of words) lists word. The file is
+// trusted only as a regular file owned by root (opened without following a link, then checked): any
+// app can write in /tmp, and one that made the Vault close on firmware without needs= would sign
+// apps out. Anything else counts as not listing it.
+func firmwareHas(caps, word string, ownerIsRoot func(os.FileInfo) bool) bool {
+	f, err := os.OpenFile(caps, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil || !fi.Mode().IsRegular() || !ownerIsRoot(fi) {
+		return false
+	}
+	b, err := io.ReadAll(io.LimitReader(f, 4<<10))
 	if err != nil {
 		return false
 	}
