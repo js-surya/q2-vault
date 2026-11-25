@@ -3,6 +3,9 @@
 // /tmp/q2-vault.sock. It uses only the standard library and imports nothing
 // from the rest of q2-vault, so an app maker can copy this directory as is.
 //
+// The client works only on Linux (the Q2): elsewhere every call returns
+// ErrNotVault, because it cannot check who owns the socket.
+//
 // How an app uses it:
 //
 //	secret, err := vault.Get()
@@ -15,6 +18,12 @@
 //	    // card not mounted: keep what you hold in memory, ask again later
 //	case errors.Is(err, vault.ErrNoVault), errors.Is(err, vault.ErrUnavailable):
 //	    // no Vault (or not answering): use your own file, as before
+//	case errors.Is(err, vault.ErrNotVault):
+//	    // something else owns the socket: use your own plain file, but warn,
+//	    // and never migrate into it or delete the plain file
+//	case errors.Is(err, vault.ErrRefused), errors.Is(err, vault.ErrTooLarge),
+//	    errors.Is(err, vault.ErrBadRequest):
+//	    // a bug (or an app the Vault does not know): don't retry
 //	}
 //
 // Fallback: with no Vault installed (ErrNoVault) keep using your own plain
@@ -24,8 +33,8 @@
 //
 // Moving an old plain file in: at start, when a Vault is there and an old
 // plain login file exists, Put its contents, Get the secret back and compare
-// it with the file, and only then delete the plain file. If anything fails,
-// leave the plain file alone.
+// exact bytes with the file. Delete the plain file only after Put, Get and
+// the compare all succeed. If anything fails, leave the plain file alone.
 //
 // Advice:
 //   - Keep tokens, not passwords.
@@ -138,11 +147,16 @@ func exchange(c *net.UnixConn, op string, body []byte) ([]byte, error) {
 	if err := c.CloseWrite(); err != nil {
 		return nil, ErrUnavailable
 	}
-	ans, err := io.ReadAll(io.LimitReader(c, maxBody+256))
-	if err != nil || len(ans) == 0 {
+	ans, err := io.ReadAll(io.LimitReader(c, maxBody+256+1))
+	if err != nil || len(ans) == 0 || len(ans) > maxBody+256 {
 		return nil, ErrUnavailable
 	}
-	return parse(ans)
+	out, err := parse(ans)
+	if err == nil && op == "get" && len(out) == 0 {
+		// the Vault never stores an empty secret
+		return nil, ErrUnavailable
+	}
+	return out, err
 }
 
 func parse(ans []byte) ([]byte, error) {
@@ -160,6 +174,9 @@ func parse(ans []byte) ([]byte, error) {
 	status, payload := string(rest[:i]), rest[i+1:]
 	switch status {
 	case "ok":
+		if len(payload) > maxBody {
+			return nil, ErrUnavailable
+		}
 		return payload, nil
 	case "none":
 		return nil, ErrNone

@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -245,5 +246,38 @@ func TestPeerCheckErrorRefuses(t *testing.T) {
 	serve(t, sock, "Q2VAULT/1\nok\nx")
 	if err := Put([]byte("x")); !errors.Is(err, ErrNotVault) {
 		t.Fatal(err)
+	}
+}
+
+func TestOversizeAnswerIsUnavailable(t *testing.T) {
+	sock, _ := setup(t)
+	serve(t, sock, "Q2VAULT/1\nok\n"+strings.Repeat("a", 16385))
+	if _, err := Get(); !errors.Is(err, ErrUnavailable) {
+		t.Fatal(err)
+	}
+}
+
+func TestMaxAnswerAccepted(t *testing.T) {
+	sock, _ := setup(t)
+	serve(t, sock, "Q2VAULT/1\nok\n"+strings.Repeat("a", 16384))
+	if b, err := Get(); err != nil || len(b) != 16384 {
+		t.Fatal(len(b), err)
+	}
+}
+
+func TestEmptyOkGetIsUnavailable(t *testing.T) {
+	sock, _ := setup(t)
+	serve(t, sock, "Q2VAULT/1\nok\n")
+	if _, err := Get(); !errors.Is(err, ErrUnavailable) {
+		t.Fatal(err)
+	}
+	if err := Put([]byte("x")); err != nil {
+		t.Fatalf("put ok with empty body must succeed: %v", err)
+	}
+}
+
+func TestDefaultHookFailsClosedOffLinux(t *testing.T) {
+	if _, err := osPeerUID(nil); runtime.GOOS != "linux" && err == nil {
+		t.Fatal("must fail closed")
 	}
 }
