@@ -29,8 +29,9 @@ var systemExe = "/release/bin/demo"
 
 // AppID names the card app running as pid: its /proc/<pid>/exe must be
 // exactly /mnt/mmc/.<id>/q2-<id> with the same valid id twice. The Vault's
-// own binary and everything else is an error.
-func AppID(procRoot string, pid int) (string, error) {
+// own binary and everything else is an error. Q2 Pod's own program, systemExe, is SystemID
+// when uid, the caller's at connect from the kernel (SO_PEERCRED), is root.
+func AppID(procRoot string, pid, uid int) (string, error) {
 	exe, err := os.Readlink(filepath.Join(procRoot, strconv.Itoa(pid), "exe"))
 	if err != nil {
 		return "", err
@@ -42,7 +43,7 @@ func AppID(procRoot string, pid int) (string, error) {
 	if exe == systemExe {
 		// Q2 Pod itself: root, and never a deleted binary (the system partition is read-only, so a
 		// deleted one isn't Q2 Pod's).
-		if deleted || !rootUID(procRoot, pid) {
+		if deleted || uid != 0 { /* uid: the kernel's, at connect (SO_PEERCRED) */
 			return "", errors.New("proto: not Q2 Pod")
 		}
 		dir, want = SystemID, systemExe
@@ -83,28 +84,4 @@ func AppID(procRoot string, pid int) (string, error) {
 		}
 	}
 	return dir, nil
-}
-
-// rootUID reports whether /proc/<pid>/status names uid 0 for the real, effective, saved and file
-// uids. Anything unreadable is not root.
-func rootUID(procRoot string, pid int) bool {
-	b, err := os.ReadFile(filepath.Join(procRoot, strconv.Itoa(pid), "status"))
-	if err != nil {
-		return false
-	}
-	for _, line := range strings.Split(string(b), "\n") {
-		if rest, ok := strings.CutPrefix(line, "Uid:"); ok {
-			f := strings.Fields(rest)
-			if len(f) != 4 {
-				return false
-			}
-			for _, v := range f {
-				if v != "0" {
-					return false
-				}
-			}
-			return true
-		}
-	}
-	return false
 }

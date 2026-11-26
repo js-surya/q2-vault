@@ -219,10 +219,10 @@ func handle(c *net.UnixConn, b Backend, procRoot string, onUse func(string), pc 
 		}
 	}()
 
-	pid, err := peerPID(c)
+	pid, uid, err := peerPID(c)
 	var id string
 	if err == nil {
-		id, err = appID(procRoot, pid)
+		id, err = appID(procRoot, pid, uid)
 	}
 	if err != nil {
 		reply(c, StatusRefused, nil)

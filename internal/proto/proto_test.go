@@ -112,7 +112,7 @@ func TestAppID(t *testing.T) {
 	touch(t, R+"/.vault/q2-vault")
 	for _, c := range cases {
 		root := fakeProc(t, 100, c.target)
-		id, err := AppID(root, 100)
+		id, err := AppID(root, 100, 1000)
 		if c.ok && (err != nil || id != c.id) {
 			t.Errorf("%q: %q %v", c.target, id, err)
 		}
@@ -120,7 +120,7 @@ func TestAppID(t *testing.T) {
 			t.Errorf("%q should be refused, got %q", c.target, id)
 		}
 	}
-	if _, err := AppID(t.TempDir(), 99999); err == nil {
+	if _, err := AppID(t.TempDir(), 99999, 1000); err == nil {
 		t.Error("missing pid should fail")
 	}
 }
@@ -135,11 +135,11 @@ func TestAppIDInode(t *testing.T) {
 	old := exeStat
 	t.Cleanup(func() { exeStat = old })
 	exeStat = func(string) (os.FileInfo, error) { return os.Stat(R + "/elsewhere") }
-	if id, err := AppID(root, 7); err == nil {
+	if id, err := AppID(root, 7, 1000); err == nil {
 		t.Errorf("different inode accepted as %q", id)
 	}
 	exeStat = func(string) (os.FileInfo, error) { return os.Stat(R + "/.plex/q2-plex") }
-	if id, err := AppID(root, 7); err != nil || id != "plex" {
+	if id, err := AppID(root, 7, 1000); err != nil || id != "plex" {
 		t.Errorf("same inode: %q %v", id, err)
 	}
 }
@@ -154,11 +154,11 @@ func TestAppIDNSFailClosed(t *testing.T) {
 	old := selfNS
 	t.Cleanup(func() { selfNS = old })
 	selfNS = self
-	if id, err := AppID(root, 7); err == nil {
+	if id, err := AppID(root, 7, 1000); err == nil {
 		t.Errorf("unreadable peer namespace accepted as %q", id)
 	}
 	selfNS = filepath.Join(t.TempDir(), "none") // kernel without ns files
-	if id, err := AppID(root, 7); err != nil || id != "plex" {
+	if id, err := AppID(root, 7, 1000); err != nil || id != "plex" {
 		t.Errorf("fallback to inode check: %q %v", id, err)
 	}
 	// ...and the inode check still bites in that fallback.
@@ -166,7 +166,7 @@ func TestAppIDNSFailClosed(t *testing.T) {
 	oldS := exeStat
 	t.Cleanup(func() { exeStat = oldS })
 	exeStat = func(string) (os.FileInfo, error) { return os.Stat(R + "/elsewhere") }
-	if _, err := AppID(root, 7); err == nil {
+	if _, err := AppID(root, 7, 1000); err == nil {
 		t.Error("inode mismatch accepted in fallback")
 	}
 }
@@ -182,12 +182,12 @@ func TestAppIDMountNS(t *testing.T) {
 	old := selfNS
 	t.Cleanup(func() { selfNS = old })
 	selfNS = self
-	if id, err := AppID(root, 7); err == nil {
+	if id, err := AppID(root, 7, 1000); err == nil {
 		t.Errorf("other mount namespace accepted as %q", id)
 	}
 	os.Remove(self)
 	os.Symlink("mnt:[2]", self)
-	if id, err := AppID(root, 7); err != nil || id != "plex" {
+	if id, err := AppID(root, 7, 1000); err != nil || id != "plex" {
 		t.Errorf("same namespace: %q %v", id, err)
 	}
 }
@@ -242,17 +242,17 @@ func (f *fake) Delete(id string) error {
 func start(t *testing.T, f *fake, caller string, used *[]string, mu *sync.Mutex) string {
 	t.Helper()
 	oldA, oldP := appID, peerPID
-	appID = func(_ string, _ int) (string, error) {
+	appID = func(_ string, _, _ int) (string, error) {
 		if caller == "" {
 			return "", errors.New("not a card app")
 		}
 		return caller, nil
 	}
-	peerPID = func(*net.UnixConn) (int, error) {
+	peerPID = func(*net.UnixConn) (int, int, error) {
 		if noPeer.Load() {
-			return 0, errors.New("no creds")
+			return 0, 0, errors.New("no creds")
 		}
-		return 1, nil
+		return 1, 1000, nil
 	}
 	noPeer.Store(false)
 	t.Cleanup(func() { appID, peerPID = oldA, oldP })
@@ -432,8 +432,8 @@ func TestServeLeavesReplacedSocket(t *testing.T) {
 	f := &fake{data: map[string][]byte{}}
 	var cancel context.CancelFunc
 	oldA, oldP := appID, peerPID
-	appID = func(string, int) (string, error) { return "plex", nil }
-	peerPID = func(*net.UnixConn) (int, error) { return 1, nil }
+	appID = func(string, int, int) (string, error) { return "plex", nil }
+	peerPID = func(*net.UnixConn) (int, int, error) { return 1, 1000, nil }
 	t.Cleanup(func() { appID, peerPID = oldA, oldP })
 	dir, _ := os.MkdirTemp("", "q2v")
 	t.Cleanup(func() { os.RemoveAll(dir) })
@@ -493,8 +493,8 @@ func TestServePerCallerCap(t *testing.T) {
 
 func TestServeShutdownCutsOpenConnections(t *testing.T) {
 	oldA, oldP := appID, peerPID
-	appID = func(string, int) (string, error) { return "plex", nil }
-	peerPID = func(*net.UnixConn) (int, error) { return 1, nil }
+	appID = func(string, int, int) (string, error) { return "plex", nil }
+	peerPID = func(*net.UnixConn) (int, int, error) { return 1, 1000, nil }
 	t.Cleanup(func() { appID, peerPID = oldA, oldP })
 	dir, _ := os.MkdirTemp("", "q2v")
 	t.Cleanup(func() { os.RemoveAll(dir) })
@@ -530,8 +530,8 @@ func TestServeShutdownCutsOpenConnections(t *testing.T) {
 
 func TestServeSetsAsideADirectoryAtItsPath(t *testing.T) {
 	oldA, oldP := appID, peerPID
-	appID = func(string, int) (string, error) { return "plex", nil }
-	peerPID = func(*net.UnixConn) (int, error) { return 1, nil }
+	appID = func(string, int, int) (string, error) { return "plex", nil }
+	peerPID = func(*net.UnixConn) (int, int, error) { return 1, 1000, nil }
 	t.Cleanup(func() { appID, peerPID = oldA, oldP })
 	dir, _ := os.MkdirTemp("", "q2v")
 	t.Cleanup(func() { os.RemoveAll(dir) })
@@ -597,8 +597,8 @@ func TestServeRemovesSquatterSocket(t *testing.T) {
 	}
 	ownerIsRoot = func(os.FileInfo) bool { return false }
 	oldA, oldP := appID, peerPID
-	appID = func(string, int) (string, error) { return "plex", nil }
-	peerPID = func(*net.UnixConn) (int, error) { return 1, nil }
+	appID = func(string, int, int) (string, error) { return "plex", nil }
+	peerPID = func(*net.UnixConn) (int, int, error) { return 1, 1000, nil }
 	t.Cleanup(func() { appID, peerPID = oldA, oldP })
 	f := &fake{data: map[string][]byte{}}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -620,14 +620,14 @@ func TestRefusedCallersCantHoldTheLine(t *testing.T) {
 	var refuse atomic.Bool
 	var refusals atomic.Int32
 	oldA, oldP := appID, peerPID
-	appID = func(string, int) (string, error) {
+	appID = func(string, int, int) (string, error) {
 		if refuse.Load() {
 			refusals.Add(1)
 			return "", errors.New("not a card app")
 		}
 		return "plex", nil
 	}
-	peerPID = func(*net.UnixConn) (int, error) { return 1, nil }
+	peerPID = func(*net.UnixConn) (int, int, error) { return 1, 1000, nil }
 	t.Cleanup(func() { appID, peerPID = oldA, oldP })
 	dir, _ := os.MkdirTemp("", "q2v")
 	t.Cleanup(func() { os.RemoveAll(dir) })

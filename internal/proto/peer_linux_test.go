@@ -29,7 +29,10 @@ func TestPeerPIDOSReal(t *testing.T) {
 			return
 		}
 		defer c.Close()
-		pid, err := peerPIDOS(c.(*net.UnixConn))
+		pid, uid, err := peerPIDOS(c.(*net.UnixConn))
+		if err == nil && uid != os.Getuid() {
+			pid = -2 // the kernel's uid of the caller, ours
+		}
 		if err != nil {
 			pid = -1
 		}
@@ -46,16 +49,20 @@ func TestPeerPIDOSReal(t *testing.T) {
 }
 
 func TestAppIDRejectsTestBinary(t *testing.T) {
-	if id, err := AppID("/proc", os.Getpid()); err == nil {
+	if id, err := AppID("/proc", os.Getpid(), os.Getuid()); err == nil {
 		t.Errorf("the test binary was accepted as %q", id)
 	}
 }
 
 // SO_PEERCRED end to end: only appID is hooked, the peer pid is the kernel's.
 func TestServeRealPeerCred(t *testing.T) {
-	var sawPID atomic.Int64
+	var sawPID, sawUID atomic.Int64
 	oldA := appID
-	appID = func(_ string, pid int) (string, error) { sawPID.Store(int64(pid)); return "plex", nil }
+	appID = func(_ string, pid, uid int) (string, error) {
+		sawPID.Store(int64(pid))
+		sawUID.Store(int64(uid))
+		return "plex", nil
+	}
 	t.Cleanup(func() { appID = oldA })
 	dir, _ := os.MkdirTemp("", "q2v")
 	t.Cleanup(func() { os.RemoveAll(dir) })
@@ -77,6 +84,9 @@ func TestServeRealPeerCred(t *testing.T) {
 	}
 	if int(sawPID.Load()) != os.Getpid() {
 		t.Errorf("server saw pid %d, want %d", sawPID.Load(), os.Getpid())
+	}
+	if int(sawUID.Load()) != os.Getuid() {
+		t.Errorf("server saw uid %d, want %d (the kernel's, at connect)", sawUID.Load(), os.Getuid())
 	}
 	if string(f.data["plex"]) != "secret" {
 		t.Error("not stored")
