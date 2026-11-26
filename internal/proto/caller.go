@@ -20,6 +20,13 @@ var exeStat = os.Stat
 
 var idRe = regexp.MustCompile(`^[a-z0-9-]{1,15}$`)
 
+// SystemID is Q2 Pod's own id: the firmware's program, systemExe, run as root, asks as it (its
+// scrobbling logins). No card app can have it: its folder .q2pod is refused.
+const SystemID = "q2pod"
+
+// systemExe is Q2 Pod's program, on the read-only system partition; a variable for tests.
+var systemExe = "/release/bin/demo"
+
 // AppID names the card app running as pid: its /proc/<pid>/exe must be
 // exactly /mnt/mmc/.<id>/q2-<id> with the same valid id twice. The Vault's
 // own binary and everything else is an error.
@@ -31,13 +38,25 @@ func AppID(procRoot string, pid int) (string, error) {
 	orig := exe
 	deleted := strings.HasSuffix(exe, " (deleted)")
 	exe = strings.TrimSuffix(exe, " (deleted)") // updated while running
-	rest, ok := strings.CutPrefix(exe, cardRoot+"/.")
-	if !ok {
-		return "", errors.New("proto: not a card app")
-	}
-	dir, file, ok := strings.Cut(rest, "/")
-	if !ok || !idRe.MatchString(dir) || dir == "vault" || file != "q2-"+dir {
-		return "", errors.New("proto: not a card app")
+	var dir, want string
+	if exe == systemExe {
+		// Q2 Pod itself: root, and never a deleted binary (the system partition is read-only, so a
+		// deleted one isn't Q2 Pod's).
+		if deleted || !rootUID(procRoot, pid) {
+			return "", errors.New("proto: not Q2 Pod")
+		}
+		dir, want = SystemID, systemExe
+	} else {
+		rest, ok := strings.CutPrefix(exe, cardRoot+"/.")
+		if !ok {
+			return "", errors.New("proto: not a card app")
+		}
+		var file string
+		dir, file, ok = strings.Cut(rest, "/")
+		if !ok || !idRe.MatchString(dir) || dir == "vault" || dir == SystemID || file != "q2-"+dir {
+			return "", errors.New("proto: not a card app")
+		}
+		want = cardRoot + "/." + dir + "/q2-" + dir
 	}
 	// The path alone can be faked from a private mount namespace (an app
 	// mounting its own file there). (a) Same mount namespace as the Vault, if
@@ -58,10 +77,34 @@ func AppID(procRoot string, pid int) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		want, err := os.Stat(cardRoot + "/." + dir + "/q2-" + dir)
-		if err != nil || !os.SameFile(got, want) {
+		w, err := os.Stat(want)
+		if err != nil || !os.SameFile(got, w) {
 			return "", errors.New("proto: not the card binary")
 		}
 	}
 	return dir, nil
+}
+
+// rootUID reports whether /proc/<pid>/status names uid 0 for the real, effective, saved and file
+// uids. Anything unreadable is not root.
+func rootUID(procRoot string, pid int) bool {
+	b, err := os.ReadFile(filepath.Join(procRoot, strconv.Itoa(pid), "status"))
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if rest, ok := strings.CutPrefix(line, "Uid:"); ok {
+			f := strings.Fields(rest)
+			if len(f) != 4 {
+				return false
+			}
+			for _, v := range f {
+				if v != "0" {
+					return false
+				}
+			}
+			return true
+		}
+	}
+	return false
 }
