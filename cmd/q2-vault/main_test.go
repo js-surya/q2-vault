@@ -763,3 +763,34 @@ func TestRunSetsAsideAFolderAtThePagePath(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestSweepKeepsQ2Pod(t *testing.T) {
+	cfg, clk := fixture(t)
+	cfg.Serve = asPlex
+	os.MkdirAll(cfg.Sealed, 0o700)
+	os.WriteFile(filepath.Join(cfg.Sealed, "q2pod.sealed"), []byte("x"), 0o600)
+	os.MkdirAll(cfg.Keys, 0o700)
+	st := missing.State{Missing: map[string]time.Time{"q2pod": clk.Now().Add(-30 * 24 * time.Hour)}}
+	if err := st.Save(filepath.Join(cfg.Keys, "state.json")); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := start(t, ctx, cfg)
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if !exists(filepath.Join(cfg.Sealed, "q2pod.sealed")) {
+		t.Fatal("Q2 Pod's own login swept: it has no card folder")
+	}
+	got, _ := missing.Load(filepath.Join(cfg.Keys, "state.json"))
+	if _, ok := got.Missing["q2pod"]; ok {
+		t.Fatal("q2pod still counted as missing")
+	}
+}
+
+func TestNamesQ2Pod(t *testing.T) {
+	if got := readNames(t.TempDir())["q2pod"]; got != "Q2 Pod (scrobbling)" {
+		t.Fatalf("q2pod's name %q", got)
+	}
+}

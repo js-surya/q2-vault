@@ -19,6 +19,8 @@ back only its own login, over a Unix socket. It comes with a small Go package, `
   private keys and its log key go into the Vault, and its working folder moves to RAM, so nothing of it
   but received files stays on the card. Its login stays in the Q2's internal storage.
 
+- **Q2 Pod's scrobbling** (with firmware that supports it): the Last.fm and ListenBrainz logins from `.scrobble.ini` are kept in the Vault, as "Q2 Pod (scrobbling)" on its page. Q2 Pod's own program, on the read-only system partition and running as root, is the one caller that isn't a card app.
+
 Your app can too: see [For app makers](#for-app-makers).
 
 ## What it does

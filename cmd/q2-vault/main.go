@@ -329,6 +329,9 @@ func sweep(st *store.Store, cfg config) map[string]time.Time {
 		ids[i] = e.ID
 	}
 	installed := func(id string) bool {
+		if id == proto.SystemID { // Q2 Pod itself: no card folder, never removed
+			return true
+		}
 		_, err := os.Stat(filepath.Join(cfg.Card, "."+id, "q2-"+id))
 		return err == nil
 	}
@@ -501,7 +504,7 @@ func (n *names) Get() map[string]string {
 
 // readNames reads name= from the q2app of each app on the card.
 func readNames(card string) map[string]string {
-	out := map[string]string{}
+	out := map[string]string{proto.SystemID: "Q2 Pod (scrobbling)"}
 	des, err := os.ReadDir(card)
 	if err != nil {
 		return out
