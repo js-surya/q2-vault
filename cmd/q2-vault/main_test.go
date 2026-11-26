@@ -463,7 +463,7 @@ func TestNamesReadOncePerPageRequest(t *testing.T) {
 
 func TestVersionFlag(t *testing.T) {
 	var out, errb bytes.Buffer
-	if code := cli([]string{"-version"}, &out, &errb); code != 0 || out.String() != "q2-v0.1\n" {
+	if code := cli([]string{"-version"}, &out, &errb); code != 0 || out.String() != "q2-v0.2\n" {
 		t.Fatalf("code %d, out %q, err %q", code, out.String(), errb.String())
 	}
 	if code := cli([]string{"-nope"}, &out, &errb); code != 2 {

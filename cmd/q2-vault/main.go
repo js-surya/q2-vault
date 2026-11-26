@@ -27,7 +27,7 @@ import (
 	"q2-vault/internal/store"
 )
 
-const version = "q2-v0.1"
+const version = "q2-v0.2"
 
 func main() { os.Exit(cli(os.Args[1:], os.Stdout, os.Stderr)) }
 
