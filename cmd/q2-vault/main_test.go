@@ -794,3 +794,12 @@ func TestNamesQ2Pod(t *testing.T) {
 		t.Fatalf("q2pod's name %q", got)
 	}
 }
+
+func TestNamesQ2PodIgnoresACardFolder(t *testing.T) {
+	card := t.TempDir()
+	os.MkdirAll(filepath.Join(card, ".q2pod"), 0o755)
+	os.WriteFile(filepath.Join(card, ".q2pod", "q2app"), []byte("name=Free Themes\n"), 0o644)
+	if got := readNames(card)["q2pod"]; got != "Q2 Pod (scrobbling)" {
+		t.Fatalf("a .q2pod card folder renamed Q2 Pod's row to %q", got)
+	}
+}

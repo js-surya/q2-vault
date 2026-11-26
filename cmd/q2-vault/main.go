@@ -511,7 +511,7 @@ func readNames(card string) map[string]string {
 	}
 	for _, de := range des {
 		id, ok := strings.CutPrefix(de.Name(), ".")
-		if !ok || id == "" || !de.IsDir() {
+		if !ok || id == "" || !de.IsDir() || id == proto.SystemID { // Q2 Pod's row keeps its own name
 			continue
 		}
 		b, err := os.ReadFile(filepath.Join(card, de.Name(), "q2app"))
